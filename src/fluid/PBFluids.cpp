@@ -308,6 +308,23 @@ void PBFluids::step()
         // 5. Integrate & Handle Collisions (also computes curl if vorticity enabled)
         _csIntegrate.use();
         _csIntegrate.setUint("enableVorticity", _params.enableVorticity ? 1u : 0u);
+
+        // SDF solid boundary: bind the 3D texture and hand the shader the grid
+        // metadata it needs to map world space -> texture coordinates.
+        if (_sdf && _sdf->valid()) {
+            _sdf->bindForQuery(kSDFTextureUnit);
+            const Eigen::Vector3d& o   = _sdf->origin();
+            const Eigen::Vector3i& dim = _sdf->dimensions();
+            _csIntegrate.setUint("enableSDF", 1u);
+            _csIntegrate.setUint("sdfMode", _sdfContainment ? 1u : 0u);
+            _csIntegrate.setVec4("sdfOrigin", (F32)o.x(), (F32)o.y(), (F32)o.z(), 0.0f);
+            _csIntegrate.setFloat("sdfCellSize", (F32)_sdf->cellSize());
+            _csIntegrate.setVec4("sdfResolution", (F32)dim.x(), (F32)dim.y(), (F32)dim.z(), 0.0f);
+            _csIntegrate.setFloat("sdfPadding", _sdfPadding);
+        } else {
+            _csIntegrate.setUint("enableSDF", 0u);
+        }
+
         _csIntegrate.dispatch(numGroups);
         _csIntegrate.wait();
     }

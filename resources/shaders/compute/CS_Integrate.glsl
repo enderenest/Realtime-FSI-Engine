@@ -41,6 +41,7 @@ layout(std140, binding = 0) uniform FluidConfig {
 // =========================================================================
 struct Particle {
     vec4 pos;
+    vec4 predPos;   // CPU Particle is {pos, predPos, vel}; kept so the GPU stride matches (prediction itself lives in SolverBuffer)
     vec4 vel;
 };
 
@@ -69,6 +70,33 @@ layout(std430, binding = 3) buffer CellOffsetBuffer {
 // Uniforms
 // =========================================================================
 uniform uint enableVorticity;
+
+// --- SDF boundary (solid obstacle) ---
+// The grid is built on the CPU and uploaded once as a 3D texture; here we only
+// query it. One texture() call gives hardware trilinear interpolation for free.
+uniform uint              enableSDF;
+uniform uint              sdfMode;        // 0: obstacle (keep fluid outside), 1: container (keep fluid inside)
+layout(binding = 1) uniform sampler3D sdfTexture;
+uniform vec4              sdfOrigin;      // xyz: world position of voxel (0,0,0) (vec4 to match GPU layout convention)
+uniform float             sdfCellSize;
+uniform vec4              sdfResolution;  // xyz: voxel counts (x,y,z), as float for the divide
+uniform float             sdfPadding;     // distance to keep particle centers from the surface
+
+// Signed distance at a world position: negative inside the mesh, positive outside.
+float querySDF(vec3 worldPos) {
+    vec3 texCoord = ((worldPos - sdfOrigin.xyz) / sdfCellSize + 0.5) / sdfResolution.xyz;
+    return texture(sdfTexture, texCoord).r;
+}
+
+// Outward gradient (surface normal) via central differences on the texture.
+vec3 sdfGradient(vec3 worldPos) {
+    float e = sdfCellSize;
+    return vec3(
+        querySDF(worldPos + vec3(e, 0.0, 0.0)) - querySDF(worldPos - vec3(e, 0.0, 0.0)),
+        querySDF(worldPos + vec3(0.0, e, 0.0)) - querySDF(worldPos - vec3(0.0, e, 0.0)),
+        querySDF(worldPos + vec3(0.0, 0.0, e)) - querySDF(worldPos - vec3(0.0, 0.0, e))
+    ) / (2.0 * e);
+}
 
 // =========================================================================
 // KERNEL & HASH FUNCTIONS — pre-computed coefficients
@@ -177,6 +205,36 @@ void main() {
     if (predPos.z <= ubo.boundsMin.z) { predPos.z = ubo.boundsMin.z; collidedZ = true; }
     if (predPos.z >= ubo.boundsMax.z) { predPos.z = ubo.boundsMax.z; collidedZ = true; }
 
+    // SDF boundary. querySDF is negative inside the mesh, positive outside;
+    // sdfGradient points outward. sdfNormal is set to the push direction so the
+    // velocity response further down works the same for both modes. Done before
+    // deriving velocity so the correction is reflected in v.
+    bool collidedSDF = false;
+    vec3 sdfNormal   = vec3(0.0);
+    if (enableSDF == 1u) {
+        float d    = querySDF(predPos);
+        vec3  g    = sdfGradient(predPos);
+        float glen = length(g);
+        if (glen > 1e-6) {
+            if (sdfMode == 1u) {
+                // CONTAINER: keep the particle INSIDE the mesh, at least
+                // sdfPadding from the inner wall. Push inward when it gets close.
+                if (d > -sdfPadding) {
+                    sdfNormal = -g / glen;             // inward
+                    predPos  += sdfNormal * (d + sdfPadding);
+                    collidedSDF = true;
+                }
+            } else {
+                // OBSTACLE: keep the particle OUTSIDE the solid surface.
+                if (d < sdfPadding) {
+                    sdfNormal = g / glen;              // outward
+                    predPos  += sdfNormal * (sdfPadding - d);
+                    collidedSDF = true;
+                }
+            }
+        }
+    }
+
     // Derive final velocity from the corrected position difference
     float subDt = ubo.gravity_dt.w;
     float invDt = (subDt > 0.0) ? (1.0 / subDt) : 0.0;
@@ -191,6 +249,13 @@ void main() {
     if (collidedX) vel.x *= -ubo.boundDamping;
     if (collidedY) vel.y *= -ubo.boundDamping;
     if (collidedZ) vel.z *= -ubo.boundDamping;
+
+    // SDF response: reflect the inward (normal) component of velocity with
+    // restitution = boundDamping, leaving the tangential flow along the surface.
+    if (collidedSDF) {
+        float vn = dot(vel, sdfNormal);
+        if (vn < 0.0) vel -= (1.0 + ubo.boundDamping) * vn * sdfNormal;
+    }
 
     // =========================================================================
     // COMMIT POSITIONS

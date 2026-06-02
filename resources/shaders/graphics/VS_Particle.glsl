@@ -2,6 +2,7 @@
 
 struct Particle {
     vec4 pos;
+    vec4 predPos;   // CPU Particle is {pos, predPos, vel}; kept so the GPU stride matches (prediction itself lives in SolverBuffer)
     vec4 vel;
 };
 

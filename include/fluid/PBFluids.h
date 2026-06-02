@@ -5,7 +5,8 @@
 #include "core/Types.h"
 #include "fluid/Particle.h"
 #include "fluid/NeighborSearch.h"
-#include "fluid/Kernels.h"   
+#include "fluid/Kernels.h"
+#include "fluid/SDFBoundary.h"
 #include "opengl/SSBO.h"
 #include "opengl/UBO.h"
 #include "opengl/ComputeShader.h"
@@ -103,6 +104,24 @@ public:
     void setBounds(const PVec3& minBound, const PVec3& maxBound, F32 damping = 0.0f);
 
     // ----------------------------
+    // SDF solid boundary (one-way coupling)
+    // ----------------------------
+    // Attach an SDF the fluid collides against. Non-owning: the caller keeps the
+    // SDFBoundary alive (and re-uploads it when the mesh deforms). Pass nullptr
+    // to disable. The boundary must already have been uploadToGPU()'d.
+    void setSDFBoundary(const SDFBoundary* sdf) { _sdf = sdf; }
+
+    // How far outside the surface to keep particle centers (world units).
+    // ~half the particle spacing reads well; 0 pushes exactly to the surface.
+    void setSDFPadding(F32 padding) { _sdfPadding = padding; }
+
+    // SDF interpretation:
+    //   false (obstacle)  — keep the fluid OUTSIDE the solid, flowing around it.
+    //   true  (container) — keep the fluid INSIDE the mesh, pushing escaping
+    //                       particles back in (water-tightness / leak test).
+    void setSDFContainment(bool inside) { _sdfContainment = inside; }
+
+    // ----------------------------
     // Mouse interaction
     // ----------------------------
     void setInteraction(bool active, const PVec3& pos);
@@ -183,6 +202,13 @@ private:
     SSBO<U32> _ssboLOD;        // Binding 7
     PVec3 _cameraPos{ 0, 0, 0 };
     void initLODBuffer();
+
+    // SDF solid boundary (non-owning). Queried in CS_Integrate via sampler3D
+    // bound to texture unit kSDFTextureUnit.
+    const SDFBoundary* _sdf = nullptr;
+    F32 _sdfPadding = 0.0f;
+    bool _sdfContainment = false;   // false: obstacle (around mesh); true: container (inside mesh)
+    static constexpr GLuint kSDFTextureUnit = 1;
 
     // ----------------------------
     // COMPUTE SHADER PIPELINE

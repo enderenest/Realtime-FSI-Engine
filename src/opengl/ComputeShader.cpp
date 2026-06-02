@@ -56,6 +56,11 @@ void ComputeShader::setVec3(const char* name, F32 x, F32 y, F32 z) const
 	glUniform3f(glGetUniformLocation(_id, name), x, y, z);
 }
 
+void ComputeShader::setVec4(const char* name, F32 x, F32 y, F32 z, F32 w) const
+{
+	glUniform4f(glGetUniformLocation(_id, name), x, y, z, w);
+}
+
 U32 ComputeShader::getID() { return _id; }
 
 void ComputeShader::wait() const

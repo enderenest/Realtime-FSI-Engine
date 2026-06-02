@@ -36,11 +36,10 @@ set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 
-add_subdirectory(thirdparty/glad)					#opengl 4.6 loader — must come before polyscope so its if(NOT TARGET glad) guard uses ours
+add_subdirectory(thirdparty/glad)					#opengl 4.6 loader — must come before imgui so its if(NOT TARGET glad) guard uses ours
 add_subdirectory(thirdparty/glfw-3.3.2)				#window opener
-add_subdirectory(thirdparty/polyscope)				#viewer
-# add_subdirectory(thirdparty/glm)					#math
-# add_subdirectory(thirdparty/imgui-docking)		#ui
+add_subdirectory(thirdparty/glm)					#math
+add_subdirectory(thirdparty/imgui-docking)			#ui (bundles GLFW + OpenGL3 backends, links glfw + glad)
 add_subdirectory(thirdparty/openmesh)
 add_subdirectory(thirdparty/libigl)
 
@@ -99,16 +98,20 @@ endif()
 # Ask vcpkg to find CHOLMOD (from SuiteSparse)
 find_package(CHOLMOD CONFIG REQUIRED)
 
+# For CPU parallelism
+find_package(OpenMP REQUIRED)
+
 # Tell Eigen it is allowed to use CHOLMOD
 target_compile_definitions("${CMAKE_PROJECT_NAME}" PUBLIC EIGEN_USE_CHOLMOD)
 
 target_include_directories("${CMAKE_PROJECT_NAME}" PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include/")
-target_include_directories("${CMAKE_PROJECT_NAME}" PRIVATE 
-    thirdparty/eigen 
+target_include_directories("${CMAKE_PROJECT_NAME}" PRIVATE
+    thirdparty/eigen
     thirdparty/openmesh/src
 	thirdparty/libigl/include
+	thirdparty/imgui-docking/imgui/backends   # imgui_impl_glfw.h / imgui_impl_opengl3.h
 )
 
-target_link_libraries("${CMAKE_PROJECT_NAME}" PRIVATE glad polyscope OpenMeshCore OpenMeshTools SuiteSparse::CHOLMOD)
+target_link_libraries("${CMAKE_PROJECT_NAME}" PRIVATE glad glfw glm imgui OpenMeshCore OpenMeshTools SuiteSparse::CHOLMOD OpenMP::OpenMP_CXX)
 
 

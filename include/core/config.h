@@ -19,7 +19,7 @@ struct FluidConfig {
 	F32 eps = 0.0001f;							// increased from 0.00001: cohesion needs stronger regularization
 
 	// Spawn configuration — 65K particles, dam-break block
-	U32  particleCount = 1 << 15;				// 65536 particles
+	U32  particleCount = 1 << 12;				// 4096 particles
 	PVec3 spawnMin = { 2.f, 0.2f, 2.f };		// lower corner of fluid block
 	PVec3 spawnMax = { 5.f, 5.f, 5.f };		// ~41^3 = 68921 grid slots > 65536
 	bool spawnRandom = false;					// grid spawn: uniform spacing, no overlaps
