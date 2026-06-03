@@ -47,6 +47,20 @@ public:
                        const std::vector<std::array<int, 3>>&    faces,
                        double resolution, bool verbose = true);
 
+    // ---- Deformation refit (two-way coupling) ----
+    // Cheap update when the mesh deforms but its TOPOLOGY is unchanged (same
+    // face list, same vertex count, vertices just moved). Updates triangle
+    // corner positions + face normals (O(F)), refits the retained BVH boxes in
+    // place instead of rebuilding it (O(F) vs O(F log F)), then recomputes the
+    // distance grid over the existing origin/dimensions.
+    //
+    // Intentionally O(F): the edge/vertex pseudo-normals are kept from the last
+    // full buildFromMesh (recomputing them needs the O(F log F) edge-adjacency
+    // pass). They drift slowly for small per-frame deformations; call
+    // buildFromMesh() periodically (e.g. every N frames) to refresh them and
+    // retighten the BVH. Caller must uploadToGPU() afterwards, as with build.
+    void refitFromMesh(const std::vector<std::array<double, 3>>& verts);
+
     // ---- GPU upload ----
     // Repacks the CPU grid into texture order and uploads it as an R32F volume.
     // Requires a current GL context. Call once after building, and again after
@@ -88,6 +102,12 @@ private:
     std::vector<float> _distances;                             // CPU grid, indexed by index()
 
     Texture3D          _texture;                               // GPU 3D texture (R32F)
+
+    // Fills _distances by querying the retained BVH at every voxel center.
+    // Shared by buildFromMesh (after a fresh build) and refitFromMesh (after a
+    // refit). Reads geometry + pseudo-normals from _accel; respects _origin,
+    // _cellSize, _dimensions (all set before it is called).
+    void recomputeDistances();
 
     // CPU triangle list + BVH, kept alive after the build so closestTriangle()
     // can answer contact queries. Defined in the .cpp (holds .cpp-local types).

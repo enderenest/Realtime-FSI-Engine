@@ -103,6 +103,48 @@ public:
         if (n > 0) buildRecursive(0, n);
     }
 
+    // Refit node boxes in place after the triangles moved but the topology and
+    // the tree structure are unchanged (two-way coupling). O(F): recompute each
+    // triangle's AABB from its current corners, then resize every node box.
+    //
+    // buildRecursive emplaces a parent BEFORE recursing into its children, so a
+    // node's children always have HIGHER indices than the node itself. A single
+    // reverse pass over the flat node array therefore visits every child before
+    // its parent — a valid bottom-up merge without recursion.
+    //
+    // Falls back to a full build if the structure does not match the triangle
+    // list (e.g. first call, or topology changed) so a misuse can never query a
+    // stale tree.
+    void refit(const std::vector<Tri>& tris) {
+        if (_nodes.empty() || tris.size() != _order.size()) { build(tris); return; }
+        _tris = &tris;
+
+        const int n = static_cast<int>(tris.size());
+        for (int i = 0; i < n; ++i) {
+            const Tri& t = tris[i];
+            _triAABBMin[i] = t.A.cwiseMin(t.B).cwiseMin(t.C);
+            _triAABBMax[i] = t.A.cwiseMax(t.B).cwiseMax(t.C);
+        }
+
+        for (int i = static_cast<int>(_nodes.size()) - 1; i >= 0; --i) {
+            Node& node = _nodes[i];
+            if (node.left == -1) {   // leaf — box over its triangles' AABBs
+                Eigen::Vector3d bmin( 1e30,  1e30,  1e30);
+                Eigen::Vector3d bmax(-1e30, -1e30, -1e30);
+                for (int k = node.start; k < node.start + node.count; ++k) {
+                    const int t = _order[k];
+                    bmin = bmin.cwiseMin(_triAABBMin[t]);
+                    bmax = bmax.cwiseMax(_triAABBMax[t]);
+                }
+                node.bmin = bmin;
+                node.bmax = bmax;
+            } else {                 // internal — merge children
+                node.bmin = _nodes[node.left].bmin.cwiseMin(_nodes[node.right].bmin);
+                node.bmax = _nodes[node.left].bmax.cwiseMax(_nodes[node.right].bmax);
+            }
+        }
+    }
+
     // Nearest point on the mesh surface to P (with feature + triangle index).
     Hit closestPoint(const Eigen::Vector3d& P) const {
         Hit best;
@@ -226,8 +268,9 @@ private:
 // contact queries. bvh stores a pointer into tris, so this object must outlive
 // any query and must not be relocated (it lives on the heap via shared_ptr).
 struct SDFBoundary::Accel {
-    std::vector<Tri> tris;
-    TriangleBVH      bvh;
+    std::vector<Tri>             tris;
+    std::vector<Eigen::Vector3d> vertNormals;  // angle-weighted per-vertex (for VERTEX-feature sign)
+    TriangleBVH                  bvh;
 };
 
 void SDFBoundary::buildFromMesh(
@@ -287,7 +330,8 @@ void SDFBoundary::buildFromMesh(
     // Angle-weighted vertex normals: each incident face weighted by its interior
     // angle at that vertex so skinny triangles don't dominate.
     const int numVerts = static_cast<int>(verts.size());
-    std::vector<Eigen::Vector3d> vertNormals(numVerts, Eigen::Vector3d::Zero());
+    std::vector<Eigen::Vector3d>& vertNormals = _accel->vertNormals;
+    vertNormals.assign(numVerts, Eigen::Vector3d::Zero());
     for (const auto& tri : tris) {
         auto accumulate = [&](int vi, const Eigen::Vector3d& vtx,
                               const Eigen::Vector3d& p1, const Eigen::Vector3d& p2) {
@@ -332,10 +376,24 @@ void SDFBoundary::buildFromMesh(
     // Spatial acceleration: build a BVH once, then each voxel queries it in
     // O(log F). This replaces the old O(voxels * triangles) brute-force scan.
     // Kept in _accel so closestTriangle() can reuse it after the build.
-    TriangleBVH& bvh = _accel->bvh;
-    bvh.build(tris);
+    _accel->bvh.build(tris);
 
-	// enable CPU parallelism over the voxel grid
+    // Fill the distance grid by querying the BVH at every voxel center.
+    recomputeDistances();
+
+    if (verbose) {
+        std::cout << "SDF computed: "
+                  << _dimensions.x() << "x" << _dimensions.y() << "x" << _dimensions.z()
+                  << " (" << total << " voxels, " << tris.size() << " triangles, BVH)\n";
+    }
+}
+
+void SDFBoundary::recomputeDistances() {
+    const std::vector<Tri>&             tris        = _accel->tris;
+    const std::vector<Eigen::Vector3d>& vertNormals = _accel->vertNormals;
+    const TriangleBVH&                  bvh         = _accel->bvh;
+
+    // enable CPU parallelism over the voxel grid
     #pragma omp parallel for schedule(dynamic, 1)
     for (int x = 0; x < _dimensions.x(); ++x) {
         for (int y = 0; y < _dimensions.y(); ++y) {
@@ -365,12 +423,30 @@ void SDFBoundary::buildFromMesh(
             }
         }
     }
+}
 
-    if (verbose) {
-        std::cout << "SDF computed: "
-                  << _dimensions.x() << "x" << _dimensions.y() << "x" << _dimensions.z()
-                  << " (" << total << " voxels, " << tris.size() << " triangles, BVH)\n";
+void SDFBoundary::refitFromMesh(const std::vector<std::array<double, 3>>& verts) {
+    if (!_accel || _accel->tris.empty()) return;
+
+    // Topology is fixed: pull each triangle's corners from the moved vertices
+    // (iA/iB/iC are stable indices set at build time) and refresh the face
+    // normal. Edge/vertex pseudo-normals are intentionally left at their last
+    // full-build values — see refitFromMesh() docs in the header.
+    for (Tri& tri : _accel->tris) {
+        tri.A = Eigen::Vector3d(verts[tri.iA][0], verts[tri.iA][1], verts[tri.iA][2]);
+        tri.B = Eigen::Vector3d(verts[tri.iB][0], verts[tri.iB][1], verts[tri.iB][2]);
+        tri.C = Eigen::Vector3d(verts[tri.iC][0], verts[tri.iC][1], verts[tri.iC][2]);
+        Eigen::Vector3d n = (tri.B - tri.A).cross(tri.C - tri.A);
+        const double len = n.norm();
+        if (len > 1e-12) n /= len;
+        tri.faceNormal = n;
     }
+
+    // Refit the BVH boxes in place (no re-partition), then re-evaluate the grid
+    // over the unchanged origin/dimensions. (A denting deformation stays inside
+    // the original padded bounds; the periodic full rebuild handles any drift.)
+    _accel->bvh.refit(_accel->tris);
+    recomputeDistances();
 }
 
 void SDFBoundary::uploadToGPU() {
