@@ -222,16 +222,26 @@ private:
 
 } // namespace
 
+// Triangle list + BVH retained after the build so closestTriangle() can serve
+// contact queries. bvh stores a pointer into tris, so this object must outlive
+// any query and must not be relocated (it lives on the heap via shared_ptr).
+struct SDFBoundary::Accel {
+    std::vector<Tri> tris;
+    TriangleBVH      bvh;
+};
+
 void SDFBoundary::buildFromMesh(
     const std::vector<std::array<double, 3>>& verts,
     const std::vector<std::array<int, 3>>&    faces,
-    double resolution)
+    double resolution, bool verbose)
 {
+    if (verbose) {
     #ifdef _OPENMP
         std::cout << "OpenMP enabled, max threads = " << omp_get_max_threads() << "\n";
     #else
         std::cout << "OpenMP NOT enabled\n";
     #endif
+    }
 
     // AABB
     Eigen::Vector3d bboxMin( 1e30,  1e30,  1e30);
@@ -255,8 +265,10 @@ void SDFBoundary::buildFromMesh(
     const int total = _dimensions.x() * _dimensions.y() * _dimensions.z();
     _distances.assign(total, 0.0f);
 
-    // Build the triangle list with per-feature pseudo-normals.
-    std::vector<Tri> tris;
+    // Build the triangle list with per-feature pseudo-normals. Stored in _accel
+    // (on the heap) so the list + BVH survive the build for later contact queries.
+    _accel = std::make_shared<Accel>();
+    std::vector<Tri>& tris = _accel->tris;
     tris.reserve(faces.size());
     for (const auto& f : faces) {
         Tri tri;
@@ -319,7 +331,8 @@ void SDFBoundary::buildFromMesh(
 
     // Spatial acceleration: build a BVH once, then each voxel queries it in
     // O(log F). This replaces the old O(voxels * triangles) brute-force scan.
-    TriangleBVH bvh;
+    // Kept in _accel so closestTriangle() can reuse it after the build.
+    TriangleBVH& bvh = _accel->bvh;
     bvh.build(tris);
 
 	// enable CPU parallelism over the voxel grid
@@ -353,9 +366,11 @@ void SDFBoundary::buildFromMesh(
         }
     }
 
-    std::cout << "SDF computed: "
-              << _dimensions.x() << "x" << _dimensions.y() << "x" << _dimensions.z()
-              << " (" << total << " voxels, " << tris.size() << " triangles, BVH)\n";
+    if (verbose) {
+        std::cout << "SDF computed: "
+                  << _dimensions.x() << "x" << _dimensions.y() << "x" << _dimensions.z()
+                  << " (" << total << " voxels, " << tris.size() << " triangles, BVH)\n";
+    }
 }
 
 void SDFBoundary::uploadToGPU() {
@@ -376,4 +391,16 @@ void SDFBoundary::uploadToGPU() {
                     = _distances[index(x, y, z)];
 
     _texture.upload(W, H, D, texData);
+}
+
+SDFBoundary::ClosestSurface SDFBoundary::closestTriangle(const PVec3& p) const {
+    ClosestSurface out;
+    if (!_accel || _accel->tris.empty()) return out;
+
+    const TriangleBVH::Hit hit = _accel->bvh.closestPoint(Eigen::Vector3d(p.x, p.y, p.z));
+    out.face  = hit.tri;   // original triangle index == index into the faces array
+    out.point = PVec3{ static_cast<F32>(hit.point.x()),
+                       static_cast<F32>(hit.point.y()),
+                       static_cast<F32>(hit.point.z()) };
+    return out;
 }

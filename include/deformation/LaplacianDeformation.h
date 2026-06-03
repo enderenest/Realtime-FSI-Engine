@@ -17,6 +17,14 @@ public:
     void addAnchor(int vertexIndex);
     void setControlPoint(int vertexIndex, const EVec3& targetPosition);
 
+    // Dynamic handle set (multiple control points) for fluid-driven deformation.
+    // The constrained SET (anchors + handle indices) determines the factorization;
+    // call precomputeSystem() only when the set changes. Targets-only changes need
+    // just another solve(). Replaces the previous handle set wholesale.
+    void setControlPoints(const std::vector<int>& indices, const std::vector<EVec3>& targets);
+    void clearControlPoints();
+    const std::vector<int>& getControlIndices() const { return _controlIndices; }
+
     void clearConstraints();
     void clearControlPoint();
 
@@ -49,6 +57,11 @@ private:
     std::vector<EVec3> _anchorPositions;
     int _controlIndex = -1;
     EVec3 _controlTarget = EVec3::Zero();
+
+    // Dynamic handle set (fluid-driven). Rows are appended after anchors and the
+    // legacy single control point, in this exact order, in both precompute and solve.
+    std::vector<int>   _controlIndices;
+    std::vector<EVec3> _controlTargets;
 
     void computeCotangentWeights();
     void buildLaplacianMatrix();

@@ -134,6 +134,11 @@ public:
     // Bind particle SSBO to binding 0 for rendering
     void bindParticlesForRendering() const { _ssboParticles.bindTo(0); }
 
+    // Read current particle state (pos/predPos/vel) back from the GPU into 'out'.
+    // A deliberate GPU->CPU readback used for CPU-side two-way coupling (contact
+    // detection). Call sparingly — the render path stays GPU-direct.
+    void readbackParticles(std::vector<Particle>& out);
+
 private:
     // apply forces + predict x*
     void applyForcesAndPredict();

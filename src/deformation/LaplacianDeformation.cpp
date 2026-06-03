@@ -137,6 +137,8 @@ void LaplacianDeformation::clearConstraints() {
     _anchorPositions.clear();
     _controlIndex = -1;
     _controlTarget = EVec3::Zero();
+    _controlIndices.clear();
+    _controlTargets.clear();
 }
 
 void LaplacianDeformation::clearControlPoint() {
@@ -160,11 +162,23 @@ void LaplacianDeformation::setControlPoint(int vertexIndex, const EVec3& targetP
     _controlIndex = vertexIndex;
     _controlTarget = targetPosition;
 }
+
+void LaplacianDeformation::setControlPoints(const std::vector<int>& indices,
+                                            const std::vector<EVec3>& targets) {
+    _controlIndices = indices;
+    _controlTargets = targets;
+}
+
+void LaplacianDeformation::clearControlPoints() {
+    _controlIndices.clear();
+    _controlTargets.clear();
+}
 void LaplacianDeformation::precomputeSystem() {
     //std::cout << "Precomputing solver system...\n";
 
     int vertexCount = _mesh.n_vertices();
-    int constraintCount = _anchorIndices.size() + (_controlIndex >= 0 ? 1 : 0);
+    int constraintCount = _anchorIndices.size() + (_controlIndex >= 0 ? 1 : 0)
+                        + (int)_controlIndices.size();
     int totalRows = vertexCount + constraintCount;
 
     // Laplacian mathematically requires at least 1 constraint!
@@ -190,9 +204,15 @@ void LaplacianDeformation::precomputeSystem() {
         constraintRow++;
     }
 
-    // Control point constraint
+    // Control point constraint (legacy single)
     if (_controlIndex >= 0) {
         triplets.push_back(ETriplet(constraintRow, _controlIndex, 1.0));
+        constraintRow++;
+    }
+
+    // Dynamic handle constraints (one row each)
+    for (int handleIdx : _controlIndices) {
+        triplets.push_back(ETriplet(constraintRow, handleIdx, 1.0));
         constraintRow++;
     }
 
@@ -214,7 +234,8 @@ void LaplacianDeformation::precomputeSystem() {
 }
 void LaplacianDeformation::solve() {
     int vertexCount = _mesh.n_vertices();
-    int totalRows = vertexCount + _anchorIndices.size() + (_controlIndex >= 0 ? 1 : 0);
+    int totalRows = vertexCount + _anchorIndices.size() + (_controlIndex >= 0 ? 1 : 0)
+                  + (int)_controlIndices.size();
 
     // Build right-hand side b for each axis
     // Top part: differential coordinates (delta)
@@ -234,11 +255,20 @@ void LaplacianDeformation::solve() {
         constraintRow++;
     }
 
-    // Control point target: user-defined position
+    // Control point target: user-defined position (legacy single)
     if (_controlIndex >= 0) {
         bX(constraintRow) = _controlTarget.x();
         bY(constraintRow) = _controlTarget.y();
         bZ(constraintRow) = _controlTarget.z();
+        constraintRow++;
+    }
+
+    // Dynamic handle targets (same order as precomputeSystem)
+    for (int i = 0; i < (int)_controlIndices.size(); ++i) {
+        bX(constraintRow) = _controlTargets[i].x();
+        bY(constraintRow) = _controlTargets[i].y();
+        bZ(constraintRow) = _controlTargets[i].z();
+        constraintRow++;
     }
 
     // Solve A^T * A * x = A^T * b for each axis

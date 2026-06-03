@@ -142,6 +142,23 @@ void PBFluids::setParticles(const std::vector<Particle>& particles)
     initLODBuffer();
 }
 
+void PBFluids::readbackParticles(std::vector<Particle>& out)
+{
+    const size_t n = _ssboParticles.count();
+    out.resize(n);
+    if (n == 0) return;
+
+    // Make the compute shaders' writes visible to the upcoming client-side map.
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+
+    const Particle* src = _ssboParticles.map(GL_READ_ONLY);
+    if (src) {
+        std::copy(src, src + n, out.data());
+        _ssboParticles.unmap();
+    }
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+}
+
 void PBFluids::initLODBuffer()
 {
     // Default LOD = solverIterations so all particles always active when APBF off.

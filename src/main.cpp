@@ -22,6 +22,9 @@
 #include "fluid/Particle.h"
 #include "fluid/SDFBoundary.h"
 
+#include "deformation/LaplacianDeformation.h"   // Step 3: Laplacian solid deformation
+#include "interaction/Picking.h"                // Step 3: ray-cast anchor picking
+
 #include <vector>
 #include <random>
 #include <algorithm>
@@ -32,6 +35,7 @@
 #include <cmath>
 #include <array>
 #include <filesystem>
+#include <memory>
 
 // ===================================================================
 // Window / Camera state
@@ -203,6 +207,73 @@ struct MeshData {
     std::vector<std::array<int, 3>>    faces;   // triangulated
 };
 
+// ===================================================================
+// Two-way coupling — Step 1: contact detection + per-vertex force accumulation
+// -------------------------------------------------------------------
+// Fluid particles within a thin band of the mesh surface push on it. For each
+// contacting particle we find the closest triangle (SDF's BVH), split its push
+// force across that triangle's three vertices by barycentric weight, and
+// accumulate into a per-vertex force array. Step 2 draws those forces as arrows
+// so we can verify contact location/direction/magnitude before any deformation.
+// (No deformation here — forces are computed and visualized only.)
+// ===================================================================
+static MeshData            g_meshData;          // current fitted mesh (same coords as SDF/BVH)
+static std::vector<PVec3>  g_vertForces;         // accumulated push force, per mesh vertex
+static std::vector<Particle> g_readback;         // scratch: GPU->CPU particle copy
+static std::vector<float>  g_arrowVerts;         // scratch: arrow line-segment vertices (xyz)
+
+static bool   g_couplingEnabled  = false;        // master toggle for contact detection
+static float  g_contactRadius    = 0.12f;        // surface band counted as contact (world units)
+static bool   g_useVelMagnitude  = true;         // force magnitude = velocity-into-surface vs constant
+static float  g_forceScale       = 0.50f;        // arrow length per unit force (visualization only)
+static float  g_controlThreshold = 0.50f;        // |force| above which a vertex becomes a control point
+static int    g_contactCount     = 0;            // particles that contributed force this frame
+static int    g_controlCount     = 0;            // vertices above the control-point threshold
+
+static GLuint  g_arrowVAO = 0, g_arrowVBO = 0;
+static GLsizei g_arrowVertCount = 0;             // number of arrow line vertices to draw
+
+// ===================================================================
+// Two-way coupling — Step 3: anchors-first state machine + Laplacian deform
+// -------------------------------------------------------------------
+// Anchors are vertices pinned in place (boundary conditions of the solve); the
+// user picks them before particles exist. Handles are vertices the fluid pushes,
+// determined every frame from contact forces. The Cholesky factorization depends
+// on the constrained SET (anchors + handles): anchors are permanent, handles
+// change => refactor only when the handle set changes; otherwise just re-solve.
+//
+//   Inactive : legacy fluid app (unchanged behaviour)
+//   Setup    : mesh loaded, picking anchors, no particles
+//   Ready    : anchors confirmed, factorization built, particles spawned & paused
+//   Running  : fluid flows, contacts -> handles, mesh deforms
+//   Paused   : frozen
+// ===================================================================
+enum class DeformState { Inactive, Setup, Ready, Running, Paused };
+static DeformState g_dstate = DeformState::Inactive;
+
+static MyMesh                                 g_deformMesh;   // persistent rest+deformed mesh (OpenMesh)
+static std::unique_ptr<LaplacianDeformation>  g_deformer;     // owns the cached factorization
+static std::vector<int>                       g_anchors;      // picked anchor vertex indices
+static std::vector<int>                       g_lastHandleSet;// previous frame's handle set (sorted; set-change test)
+static std::vector<EVec3>                      g_restPositions;// rest vertex positions (captured at Confirm)
+
+static float g_stiffness       = 1.0f;    // force -> displacement gain
+static float g_maxDisplacement = 0.02f;   // per-frame displacement clamp (keeps the solve stable)
+static float g_maxTotalDisp    = 0.40f;   // hard clamp on |deformed - rest| (stops the mesh blowing up)
+static bool  g_restoreEnabled  = true;    // elastic spring-back toward the rest shape
+static float g_restoreStrength = 0.05f;   // fraction of the remaining offset removed per frame
+static int   g_refactorCount   = 0;       // diagnostics: factorizations this run
+static int   g_handleCount     = 0;       // active handles this frame
+
+static GLuint  g_anchorVAO = 0, g_anchorVBO = 0;
+static GLsizei g_anchorPtCount = 0;      // anchor points to draw
+static bool    g_prevLeftDown = false;   // edge-detect for anchor picking clicks
+
+static bool isAnchor(int v) {
+    for (int a : g_anchors) if (a == v) return true;
+    return false;
+}
+
 static bool loadOFF(const std::string& path, MeshData& out) {
     std::ifstream f(path);
     if (!f) { std::cerr << "Cannot open: " << path << "\n"; return false; }
@@ -276,6 +347,11 @@ static void uploadMeshAndSDF(const MeshData& m, PBFluids& fluid) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_meshEBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * sizeof(unsigned), idx.data(), GL_STATIC_DRAW);
     glBindVertexArray(0);
+
+    // Keep the mesh on the CPU (same world coords as the SDF/BVH) so two-way
+    // coupling can look up triangle vertices for barycentric force splitting.
+    g_meshData = m;
+    g_vertForces.assign(m.verts.size(), PVec3{ 0.f, 0.f, 0.f });
 }
 
 // Load mesh -> fit into domain -> build SDF -> attach -> draw. (obstacle by default)
@@ -326,6 +402,340 @@ static void loadContainerBox(PBFluids& fluid) {
     MeshData box = makeBoxMesh(kContainerCenter, kContainerHalf);
     uploadMeshAndSDF(box, fluid);
     std::cout << "SDF container box loaded (leak test)\n";
+}
+
+// ===================================================================
+// Two-way coupling — Step 1 implementation
+// ===================================================================
+
+// Cheap nearest-voxel SDF lookup used only to reject particles that are clearly
+// far from the surface before paying for a BVH query. Returns a large value when
+// the point is outside the SDF grid.
+static float sampleSDFNearest(const PVec3& P) {
+    const Eigen::Vector3d& o   = g_sdf.origin();
+    const double           cs  = g_sdf.cellSize();
+    const Eigen::Vector3i& dim = g_sdf.dimensions();
+    const int ix = (int)std::lround((P.x - o.x()) / cs);
+    const int iy = (int)std::lround((P.y - o.y()) / cs);
+    const int iz = (int)std::lround((P.z - o.z()) / cs);
+    if (ix < 0 || iy < 0 || iz < 0 || ix >= dim.x() || iy >= dim.y() || iz >= dim.z())
+        return 1e30f;
+    return g_sdf.distances()[g_sdf.index(ix, iy, iz)];
+}
+
+// Barycentric coordinates (u,v,w) of point Pt with respect to triangle (A,B,C),
+// so Pt = u*A + v*B + w*C. Pt comes from closestPointOnTriangle, so it lies on
+// the triangle and the weights are already in [0,1]; we clamp/normalize for safety.
+static void barycentric(const EVec3& Pt, const EVec3& A, const EVec3& B, const EVec3& C,
+                        float& u, float& v, float& w) {
+    const EVec3 v0 = B - A, v1 = C - A, v2 = Pt - A;
+    const double d00 = v0.dot(v0), d01 = v0.dot(v1), d11 = v1.dot(v1);
+    const double d20 = v2.dot(v0), d21 = v2.dot(v1);
+    const double denom = d00 * d11 - d01 * d01;
+    if (std::abs(denom) < 1e-20) { u = 1.f; v = 0.f; w = 0.f; return; }
+    const double vv = (d11 * d20 - d01 * d21) / denom;
+    const double ww = (d00 * d21 - d01 * d20) / denom;
+    double uu = 1.0 - vv - ww;
+    uu = std::max(0.0, uu); double vc = std::max(0.0, vv), wc = std::max(0.0, ww);
+    const double s = uu + vc + wc;
+    if (s > 1e-20) { uu /= s; vc /= s; wc /= s; }
+    u = (float)uu; v = (float)vc; w = (float)wc;
+}
+
+// Append one force arrow (a shaft + two head barbs) to 'out' as GL_LINES vertices.
+static void pushArrow(std::vector<float>& out, const PVec3& base, const PVec3& vec) {
+    auto push = [&](const PVec3& p) { out.push_back(p.x); out.push_back(p.y); out.push_back(p.z); };
+    const PVec3 tip = base + vec;
+    push(base); push(tip);                       // shaft
+
+    const float len = norm(vec);
+    if (len < 1e-6f) return;
+    const PVec3 d = vec * (1.0f / len);
+    // A vector not parallel to d, to build a perpendicular for the arrowhead.
+    const PVec3 ref = (std::fabs(d.y) < 0.9f) ? PVec3{ 0,1,0 } : PVec3{ 1,0,0 };
+    PVec3 side{ d.y * ref.z - d.z * ref.y,        // d x ref
+                d.z * ref.x - d.x * ref.z,
+                d.x * ref.y - d.y * ref.x };
+    const float sl = norm(side);
+    if (sl < 1e-6f) return;
+    side *= (1.0f / sl);
+    const float hs = len * 0.25f;                 // head size
+    const PVec3 backTip = tip - d * hs;
+    push(tip); push(backTip + side * hs);
+    push(tip); push(backTip - side * hs);
+}
+
+// Detect contacts, distribute push forces onto mesh vertices by barycentric
+// weight, and rebuild the arrow buffer. No deformation — Step 1 + Step 2 only.
+static void computeContactForces(PBFluids& fluid) {
+    g_arrowVertCount = 0;
+    g_contactCount   = 0;
+    g_controlCount   = 0;
+    if (!g_sdf.valid() || g_meshData.verts.empty()) return;
+
+    std::fill(g_vertForces.begin(), g_vertForces.end(), PVec3{ 0.f, 0.f, 0.f });
+    fluid.readbackParticles(g_readback);
+
+    const float band = g_contactRadius;
+    const float cell = (float)g_sdf.cellSize();
+
+    for (const Particle& pt : g_readback) {
+        const PVec3 P = pt.pos;
+
+        // Reject particles clearly away from the surface (cheap), then test exactly.
+        if (std::fabs(sampleSDFNearest(P)) > band + cell) continue;
+
+        const SDFBoundary::ClosestSurface cs = g_sdf.closestTriangle(P);
+        if (cs.face < 0) continue;
+
+        const PVec3 toSurf = cs.point - P;        // points from the fluid into the surface
+        const float dist   = norm(toSurf);
+        if (dist > band) continue;
+
+        const std::array<int, 3>& f = g_meshData.faces[cs.face];
+        const EVec3 A(g_meshData.verts[f[0]][0], g_meshData.verts[f[0]][1], g_meshData.verts[f[0]][2]);
+        const EVec3 B(g_meshData.verts[f[1]][0], g_meshData.verts[f[1]][1], g_meshData.verts[f[1]][2]);
+        const EVec3 C(g_meshData.verts[f[2]][0], g_meshData.verts[f[2]][1], g_meshData.verts[f[2]][2]);
+
+        // Push direction: into the surface. Use particle->surface when well-defined,
+        // else the inward face normal (faces are oriented outward, so negate).
+        PVec3 dir;
+        if (dist > 1e-6f) {
+            dir = toSurf * (1.0f / dist);
+        } else {
+            const EVec3 n = (B - A).cross(C - A).normalized();
+            dir = toPlain(-n);
+        }
+
+        // Magnitude: how hard the fluid presses. Velocity component into the
+        // surface (grows with the push), or a flat 1.0 per contact.
+        float mag = 1.0f;
+        if (g_useVelMagnitude) {
+            mag = std::max(0.0f, dot(pt.vel, dir));
+            if (mag <= 0.0f) continue;            // not actually pressing inward
+        }
+
+        float u, v, w;
+        const EVec3 Pt(cs.point.x, cs.point.y, cs.point.z);
+        barycentric(Pt, A, B, C, u, v, w);
+
+        const PVec3 force = dir * mag;
+        g_vertForces[f[0]] += force * u;
+        g_vertForces[f[1]] += force * v;
+        g_vertForces[f[2]] += force * w;
+        ++g_contactCount;
+    }
+
+    // Build the arrow line buffer and count control points (threshold crossings).
+    g_arrowVerts.clear();
+    for (size_t i = 0; i < g_vertForces.size(); ++i) {
+        const PVec3 F = g_vertForces[i];
+        const float m = norm(F);
+        if (m < 1e-5f) continue;
+        if (m >= g_controlThreshold) ++g_controlCount;
+        const PVec3 base{ (float)g_meshData.verts[i][0],
+                          (float)g_meshData.verts[i][1],
+                          (float)g_meshData.verts[i][2] };
+        pushArrow(g_arrowVerts, base, F * g_forceScale);
+    }
+    g_arrowVertCount = (GLsizei)(g_arrowVerts.size() / 3);
+
+    if (g_arrowVertCount > 0) {
+        glBindBuffer(GL_ARRAY_BUFFER, g_arrowVBO);
+        glBufferData(GL_ARRAY_BUFFER, g_arrowVerts.size() * sizeof(float),
+                     g_arrowVerts.data(), GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+}
+
+// ===================================================================
+// Two-way coupling — Step 3 implementation (state machine + deformer)
+// ===================================================================
+
+// Rebuild the GL wireframe VBO positions from g_meshData (after a deform). The
+// vertex count never changes, so a sub-data update is enough.
+static void updateMeshVBO() {
+    std::vector<float> pos; pos.reserve(g_meshData.verts.size() * 3);
+    for (auto& v : g_meshData.verts) {
+        pos.push_back((float)v[0]); pos.push_back((float)v[1]); pos.push_back((float)v[2]);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, g_meshVBO);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, pos.size() * sizeof(float), pos.data());
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+// Build the persistent OpenMesh from the current (rest) g_meshData. Vertex order
+// matches g_meshData / g_vertForces indices, so contact indices map straight in.
+static void buildDeformMeshFromData() {
+    g_deformMesh.clear();
+    std::vector<MyMesh::VertexHandle> vh(g_meshData.verts.size());
+    for (size_t i = 0; i < g_meshData.verts.size(); ++i)
+        vh[i] = g_deformMesh.add_vertex(MyMesh::Point(
+            g_meshData.verts[i][0], g_meshData.verts[i][1], g_meshData.verts[i][2]));
+    for (auto& f : g_meshData.faces)
+        g_deformMesh.add_face(vh[f[0]], vh[f[1]], vh[f[2]]);
+}
+
+// Refresh the anchor-point buffer (green dots) from current deform-mesh positions.
+static void rebuildAnchorBuffer() {
+    g_anchorPtCount = (GLsizei)g_anchors.size();
+    if (g_anchorPtCount == 0 || g_deformMesh.n_vertices() == 0) { g_anchorPtCount = 0; return; }
+    std::vector<float> pts; pts.reserve(g_anchors.size() * 3);
+    for (int a : g_anchors) {
+        auto p = g_deformMesh.point(MyMesh::VertexHandle(a));
+        pts.push_back((float)p[0]); pts.push_back((float)p[1]); pts.push_back((float)p[2]);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, g_anchorVBO);
+    glBufferData(GL_ARRAY_BUFFER, pts.size() * sizeof(float), pts.data(), GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+// After a solve: deform mesh -> g_meshData -> GL wireframe -> SDF/BVH rebuild +
+// GPU upload, so the fluid collides against the new shape next frame.
+static void syncDeformedMesh(PBFluids& fluid) {
+    for (int i = 0; i < (int)g_meshData.verts.size(); ++i) {
+        auto p = g_deformMesh.point(MyMesh::VertexHandle(i));
+        g_meshData.verts[i] = { p[0], p[1], p[2] };
+    }
+    updateMeshVBO();
+    rebuildAnchorBuffer();
+    g_sdf.buildFromMesh(g_meshData.verts, g_meshData.faces, g_sdfCell, /*verbose=*/false);
+    g_sdf.uploadToGPU();
+    fluid.setSDFBoundary(&g_sdf);
+    fluid.setSDFPadding(g_sdfPadding);
+    fluid.setSDFContainment(g_sdfContainer);
+}
+
+// One deformation step (STATE_RUNNING).
+//
+// A vertex is a handle this frame if the fluid is pushing it (force over the
+// threshold) OR it is still relaxing back toward rest (restoring force on, and it
+// was a handle last frame). For each handle the target is:
+//
+//     target = current + fluidPush          // dent inward
+//     target += restoreStrength*(rest-target)// elastic pull back toward rest
+//     target = clamp(target, rest, maxTotalDisp)
+//
+// Free (unconstrained) vertices follow the smooth, rest-based reconstruction, so
+// when the handles ease back to rest the whole mesh does too. The factorization is
+// rebuilt only when the handle SET changes; targets-only changes just re-solve.
+static void deformStep(PBFluids& fluid, float dt) {
+    g_handleCount = 0;
+    if (!g_deformer || (int)g_restPositions.size() != (int)g_vertForces.size()) return;
+
+    const std::vector<int>& prev = g_lastHandleSet;   // sorted (built in ascending order)
+    auto wasHandle = [&](int i) { return std::binary_search(prev.begin(), prev.end(), i); };
+
+    std::vector<int>   handles;
+    std::vector<EVec3> targets;
+    for (int i = 0; i < (int)g_vertForces.size(); ++i) {
+        if (isAnchor(i)) continue;                    // anchors have their own pinned rows
+
+        auto p = g_deformMesh.point(MyMesh::VertexHandle(i));
+        const EVec3 cur  = EVec3(p[0], p[1], p[2]);
+        const EVec3 rest = g_restPositions[i];
+
+        const bool  pushed   = norm(g_vertForces[i]) >= g_controlThreshold;
+        const double offset  = (cur - rest).norm();
+        // Keep relaxing only vertices we were already controlling, so the solve's
+        // free neighbours don't all get promoted to handles.
+        const bool  relaxing = g_restoreEnabled && wasHandle(i) && offset > 1e-3;
+        if (!pushed && !relaxing) continue;
+
+        EVec3 target = cur;
+
+        // Fluid push into the surface, clamped per frame so spikes can't explode.
+        if (pushed) {
+            PVec3 disp = g_vertForces[i] * (g_stiffness * dt);
+            const float dm = norm(disp);
+            if (dm > g_maxDisplacement && dm > 1e-12f) disp *= (g_maxDisplacement / dm);
+            target += EVec3(disp.x, disp.y, disp.z);
+        }
+
+        // Elastic restoring force: ease the target toward the rest position.
+        if (g_restoreEnabled)
+            target += (double)g_restoreStrength * (rest - target);
+
+        // Safety clamp: never let a vertex stray further than g_maxTotalDisp from rest.
+        EVec3 fromRest = target - rest;
+        const double off = fromRest.norm();
+        if (off > g_maxTotalDisp) target = rest + fromRest * (g_maxTotalDisp / off);
+
+        handles.push_back(i);
+        targets.push_back(target);
+    }
+    g_handleCount = (int)handles.size();
+
+    const bool setChanged = (handles != g_lastHandleSet);
+    g_deformer->setControlPoints(handles, targets);
+    if (setChanged) {
+        g_deformer->precomputeSystem();               // constrained SET changed -> refactor
+        ++g_refactorCount;
+    }
+    g_lastHandleSet = handles;
+
+    // Solve when there are active constraints, or exactly once more right after the
+    // set empties (so the mesh settles cleanly back to its rest shape).
+    if (!handles.empty() || setChanged) {
+        g_deformer->solve();
+        syncDeformedMesh(fluid);
+    }
+}
+
+// SETUP transition: drop particles, build the rest mesh, clear anchors.
+static void enterSetup(PBFluids& fluid) {
+    g_dstate = DeformState::Setup;
+    g_deformer.reset();                            // release the old factorization first
+    fluid.setParticles(std::vector<Particle>{});  // no particles while picking anchors
+    buildDeformMeshFromData();
+    g_anchors.clear();
+    g_lastHandleSet.clear();
+    g_restPositions.clear();
+    rebuildAnchorBuffer();
+}
+
+// SETUP -> READY: build the anchors-only factorization, then spawn (paused).
+static void confirmAnchorsAndSpawn(PBFluids& fluid, const FluidConfig& fc) {
+    if (g_anchors.empty()) { std::cerr << "[Deform] Pick at least one anchor first.\n"; return; }
+    g_deformer = std::make_unique<LaplacianDeformation>(g_deformMesh);
+    g_deformer->initialize();                     // rest differential coordinates (once)
+    for (int a : g_anchors) g_deformer->addAnchor(a);
+    g_deformer->precomputeSystem();               // factorization with anchors only
+    ++g_refactorCount;
+    g_lastHandleSet.clear();
+
+    // Snapshot the rest shape so the restoring force has a target to return to.
+    g_restPositions.resize(g_deformMesh.n_vertices());
+    for (int i = 0; i < (int)g_restPositions.size(); ++i) {
+        auto p = g_deformMesh.point(MyMesh::VertexHandle(i));
+        g_restPositions[i] = EVec3(p[0], p[1], p[2]);
+    }
+
+    fluid.setParticles(spawnParticles(fc));       // spawn; stays paused until Start
+    g_dstate = DeformState::Ready;
+}
+
+// HARD RESET: return both the solid and the fluid to their initial state.
+// Drops all deformation state, reloads the boundary mesh to its rest shape
+// (which rebuilds the SDF + BVH + wireframe), and respawns the fluid.
+static void hardReset(PBFluids& fluid, const FluidConfig& fc) {
+    g_dstate = DeformState::Inactive;
+    g_deformer.reset();
+    g_anchors.clear();
+    g_lastHandleSet.clear();
+    g_restPositions.clear();
+    g_anchorPtCount = 0;
+    g_arrowVertCount = 0;
+    g_handleCount = 0;
+
+    // Reload the boundary mesh from its source so deformation is undone.
+    if (g_selFile >= 0 && g_selFile < (int)g_offFiles.size())
+        loadMeshBoundary(g_offFiles[g_selFile], fluid);
+    else if (g_sdfContainer)
+        loadContainerBox(fluid);
+
+    // Respawn the fluid at its initial configuration.
+    fluid.setParticles(spawnParticles(fc));
 }
 
 // ===================================================================
@@ -397,6 +807,24 @@ int main() {
     glGenBuffers(1, &g_meshEBO);
     scanOffAssets();
 
+    // ------ Force-arrow buffers (Step 2 visualization, drawn with lineProg) --
+    glGenVertexArrays(1, &g_arrowVAO);
+    glGenBuffers(1, &g_arrowVBO);
+    glBindVertexArray(g_arrowVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_arrowVBO);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glBindVertexArray(0);
+
+    // ------ Anchor-point buffers (Step 3, drawn with lineProg as GL_POINTS) --
+    glGenVertexArrays(1, &g_anchorVAO);
+    glGenBuffers(1, &g_anchorVBO);
+    glBindVertexArray(g_anchorVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_anchorVBO);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glBindVertexArray(0);
+
     // Center camera on bounds
     g_camTarget = glm::vec3(
         (cfg.fluid.boundsMin.x + cfg.fluid.boundsMax.x) * 0.5f,
@@ -455,21 +883,39 @@ int main() {
         }
         else { midDown = false; }
 
-        // ---- Mouse interaction (left click) ---------------------
+        // ---- Left click: anchor picking (Setup) or fluid push (else) ----
         {
-            bool interacting = false;
+            const bool leftDown = (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS)
+                                  && !ImGui::GetIO().WantCaptureMouse;
+            const bool leftPressed = leftDown && !g_prevLeftDown;   // rising edge
+
+            glm::mat4 V = viewMatrix();
+            float aspect = (float)g_winW / std::max((float)g_winH, 1.f);
+            glm::mat4 P = glm::perspective(glm::radians(45.f), aspect, 0.01f, 100.f);
+
+            bool  interacting = false;
             PVec3 hitPos{ 0,0,0 };
 
-            if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS && !ImGui::GetIO().WantCaptureMouse) {
-                double mx, my;
-                glfwGetCursorPos(window, &mx, &my);
+            if (g_dstate == DeformState::Setup) {
+                // Toggle anchor vertices on the rest mesh by clicking.
+                if (leftPressed && g_deformMesh.n_vertices() > 0) {
+                    double mx, my; glfwGetCursorPos(window, &mx, &my);
+                    Ray ray = screenToRay((float)mx, (float)my, g_winW, g_winH, V, P);
+                    PickResult pr = pickVertex(ray, g_deformMesh);
+                    if (pr.hit && pr.vertexIndex >= 0) {
+                        auto it = std::find(g_anchors.begin(), g_anchors.end(), pr.vertexIndex);
+                        if (it == g_anchors.end()) g_anchors.push_back(pr.vertexIndex);
+                        else                       g_anchors.erase(it);
+                        rebuildAnchorBuffer();
+                    }
+                }
+                // (no fluid interaction while picking anchors)
+            }
+            else if (leftDown) {
+                double mx, my; glfwGetCursorPos(window, &mx, &my);
 
                 float ndcX = 2.0f * (float)mx / (float)g_winW - 1.0f;
                 float ndcY = 1.0f - 2.0f * (float)my / (float)g_winH;
-
-                glm::mat4 V = viewMatrix();
-                float aspect = (float)g_winW / std::max((float)g_winH, 1.f);
-                glm::mat4 P = glm::perspective(glm::radians(45.f), aspect, 0.01f, 100.f);
 
                 glm::vec4 rayClip(ndcX, ndcY, -1.0f, 1.0f);
                 glm::vec4 rayEye = glm::inverse(P) * rayClip;
@@ -493,7 +939,9 @@ int main() {
                     }
                 }
             }
+
             fluid.setInteraction(interacting, hitPos);
+            g_prevLeftDown = leftDown;
         }
 
         // ---- ImGui frame ----------------------------------------
@@ -502,7 +950,7 @@ int main() {
         ImGui::NewFrame();
 
         ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-        ImGui::Text("FPS: %d  |  Particles: %u", fps, cfg.fluid.particleCount);
+        ImGui::Text("FPS: %d  |  Particles: %u", fps, fluid.params().particleCount);
         ImGui::Separator();
 
         // Scene selector
@@ -535,6 +983,15 @@ int main() {
             glBindBuffer(GL_ARRAY_BUFFER, 0);
 
             fluid.setParticles(spawnParticles(cfg.fluid));
+
+            // Switching scenes invalidates any in-progress deformation session.
+            g_dstate = DeformState::Inactive;
+            g_deformer.reset();
+            g_anchors.clear();
+            g_lastHandleSet.clear();
+            g_restPositions.clear();
+            g_anchorPtCount = 0;
+            g_arrowVertCount = 0;
 
             // Scene-specific SDF setup: the container scene drops in a box that
             // holds the fluid; every other scene starts with the SDF cleared.
@@ -618,6 +1075,68 @@ int main() {
             if (ImGui::Button("Rescan")) scanOffAssets();
         }
 
+        ImGui::Separator(); ImGui::Text("Two-Way Coupling (Step 1: Contacts)");
+        ImGui::Checkbox("enableCoupling (contact forces + arrows)", &g_couplingEnabled);
+        ImGui::SliderFloat("contactRadius", &g_contactRadius, 0.01f, 0.5f, "%.3f");
+        ImGui::Checkbox("magnitude = velocity into surface", &g_useVelMagnitude);
+        ImGui::SliderFloat("arrowScale", &g_forceScale, 0.01f, 3.0f, "%.3f");
+        ImGui::SliderFloat("controlThreshold (handle threshold)", &g_controlThreshold, 0.0f, 5.0f, "%.3f");
+        ImGui::Text("contacts: %d   control pts: %d", g_contactCount, g_controlCount);
+
+        ImGui::Separator(); ImGui::Text("Deformation (Step 3: anchors -> handles)");
+        {
+            const char* stateName =
+                g_dstate == DeformState::Inactive ? "Inactive" :
+                g_dstate == DeformState::Setup    ? "Setup (pick anchors)" :
+                g_dstate == DeformState::Ready    ? "Ready (paused)" :
+                g_dstate == DeformState::Running  ? "Running" : "Paused";
+            ImGui::Text("state: %s   anchors: %d   handles: %d   refactors: %d",
+                        stateName, (int)g_anchors.size(), g_handleCount, g_refactorCount);
+
+            const bool haveMesh = g_sdfEnabled && !g_meshData.verts.empty();
+
+            if (g_dstate == DeformState::Inactive) {
+                if (!haveMesh) ImGui::TextDisabled("Load an SDF mesh first.");
+                if (haveMesh && ImGui::Button("Setup Anchors (clears particles)"))
+                    enterSetup(fluid);
+            }
+            else if (g_dstate == DeformState::Setup) {
+                ImGui::TextWrapped("Left-click mesh vertices to toggle anchors (green).");
+                if (ImGui::Button("Confirm Anchors & Spawn"))
+                    confirmAnchorsAndSpawn(fluid, cfg.fluid);
+                ImGui::SameLine();
+                if (ImGui::Button("Clear Anchors")) { g_anchors.clear(); rebuildAnchorBuffer(); }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel")) { g_dstate = DeformState::Inactive; g_anchors.clear(); rebuildAnchorBuffer(); }
+            }
+            else if (g_dstate == DeformState::Ready) {
+                if (ImGui::Button("Start")) g_dstate = DeformState::Running;
+                ImGui::SameLine();
+                if (ImGui::Button("Back to Setup")) enterSetup(fluid);
+            }
+            else if (g_dstate == DeformState::Running) {
+                if (ImGui::Button("Pause")) g_dstate = DeformState::Paused;
+            }
+            else if (g_dstate == DeformState::Paused) {
+                if (ImGui::Button("Resume")) g_dstate = DeformState::Running;
+                ImGui::SameLine();
+                if (ImGui::Button("Back to Setup")) enterSetup(fluid);
+            }
+
+            ImGui::SliderFloat("stiffness", &g_stiffness, 0.0f, 20.0f, "%.2f");
+            ImGui::SliderFloat("maxDisplacement/frame", &g_maxDisplacement, 0.001f, 0.5f, "%.3f");
+            ImGui::SliderFloat("maxTotalDisplacement", &g_maxTotalDisp, 0.01f, 2.0f, "%.3f");
+
+            ImGui::Checkbox("restoring force (spring back to rest)", &g_restoreEnabled);
+            ImGui::SliderFloat("restoreStrength", &g_restoreStrength, 0.001f, 0.5f, "%.3f");
+
+            // Hard reset: both solid and fluid back to their initial state.
+            if (ImGui::Button("HARD RESET (mesh + fluid)")) {
+                hardReset(fluid, cfg.fluid);
+                paused = true;   // leave it frozen at the initial state
+            }
+        }
+
         ImGui::Separator(); ImGui::Text("Neighbor Search");
         {
             int hs = (int)cfg.fluid.hashSize;
@@ -688,7 +1207,11 @@ int main() {
         }
 
         // ---- Simulation step (GPU only) -------------------------
-        if (!paused || stepOnce) {
+        // Inactive (legacy): driven by the paused/Step controls.
+        // Deformation states: only Running advances the fluid.
+        bool doStep = (g_dstate == DeformState::Inactive) ? (!paused || stepOnce)
+                                                          : (g_dstate == DeformState::Running);
+        if (doStep) {
             // Pass camera position for APBF LOD computation
             float cx = g_camDist * cosf(g_camPitch) * sinf(g_camYaw);
             float cy = g_camDist * sinf(g_camPitch);
@@ -699,6 +1222,16 @@ int main() {
             fluid.step();
             stepOnce = false;
         }
+
+        // ---- Two-way coupling: contacts (Step 1) + deform (Step 3) ----
+        // Contacts are needed when visualizing arrows OR when Running (handles
+        // come from these forces). Deformation runs only in the Running state.
+        const bool wantContacts = g_sdfEnabled &&
+                                  (g_couplingEnabled || g_dstate == DeformState::Running);
+        if (wantContacts) computeContactForces(fluid);
+        else              g_arrowVertCount = 0;
+
+        if (g_dstate == DeformState::Running) deformStep(fluid, cfg.fluid.dt);
 
         // ---- Clear -----------------------------------------------
         glClearColor(0.2f, 0.2f, 0.2f, 1.0f);
@@ -724,7 +1257,9 @@ int main() {
         fluid.bindParticlesForRendering();   // SSBO 0 stays on GPU
 
         glBindVertexArray(emptyVAO);
-        glDrawArraysInstanced(GL_POINTS, 0, 1, cfg.fluid.particleCount);
+        // Use the live particle count (0 during Setup, may differ from the config
+        // when a grid spawn under-fills) so we never read past the SSBO.
+        glDrawArraysInstanced(GL_POINTS, 0, 1, fluid.params().particleCount);
         glBindVertexArray(0);
 
         glDisable(GL_PROGRAM_POINT_SIZE);
@@ -751,6 +1286,29 @@ int main() {
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         }
 
+        // ---- Draw contact-force arrows (Step 2 checkpoint) ------
+        if (g_arrowVertCount > 0) {
+            glUseProgram(lineProg);
+            glUniformMatrix4fv(glGetUniformLocation(lineProg, "VP"), 1, GL_FALSE, glm::value_ptr(VP));
+            glUniform3f(glGetUniformLocation(lineProg, "color"), 1.0f, 0.25f, 0.1f);  // red-orange
+            glBindVertexArray(g_arrowVAO);
+            glDrawArrays(GL_LINES, 0, g_arrowVertCount);
+            glBindVertexArray(0);
+        }
+
+        // ---- Draw anchor points (Step 3) ------------------------
+        // lineProg has no gl_PointSize, so use fixed-function point size
+        // (GL_PROGRAM_POINT_SIZE must stay disabled for glPointSize to apply).
+        if (g_anchorPtCount > 0) {
+            glUseProgram(lineProg);
+            glUniformMatrix4fv(glGetUniformLocation(lineProg, "VP"), 1, GL_FALSE, glm::value_ptr(VP));
+            glUniform3f(glGetUniformLocation(lineProg, "color"), 0.2f, 1.0f, 0.3f);   // green anchors
+            glPointSize(12.0f);
+            glBindVertexArray(g_anchorVAO);
+            glDrawArrays(GL_POINTS, 0, g_anchorPtCount);
+            glBindVertexArray(0);
+        }
+
         // ---- ImGui overlay --------------------------------------
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -769,6 +1327,10 @@ int main() {
     glDeleteVertexArrays(1, &g_meshVAO);
     glDeleteBuffers(1, &g_meshVBO);
     glDeleteBuffers(1, &g_meshEBO);
+    glDeleteVertexArrays(1, &g_arrowVAO);
+    glDeleteBuffers(1, &g_arrowVBO);
+    glDeleteVertexArrays(1, &g_anchorVAO);
+    glDeleteBuffers(1, &g_anchorVBO);
     glDeleteProgram(particleProg);
     glDeleteProgram(lineProg);
 

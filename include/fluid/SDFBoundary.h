@@ -2,6 +2,7 @@
 #define SDF_BOUNDARY_H
 
 #include <array>
+#include <memory>
 #include <vector>
 
 #include <Eigen/Core>
@@ -40,9 +41,11 @@ public:
     // faces:      triangle indices into verts (already triangulated).
     // resolution: voxel edge length in world units. Match it to the PBF
     //             particle diameter so the boundary resolves the fluid.
+    // verbose: print build stats to stdout. Pass false for per-frame rebuilds
+    // (two-way coupling) to avoid flooding the console.
     void buildFromMesh(const std::vector<std::array<double, 3>>& verts,
                        const std::vector<std::array<int, 3>>&    faces,
-                       double resolution);
+                       double resolution, bool verbose = true);
 
     // ---- GPU upload ----
     // Repacks the CPU grid into texture order and uploads it as an R32F volume.
@@ -66,6 +69,18 @@ public:
         return x * _dimensions.y() * _dimensions.z() + y * _dimensions.z() + z;
     }
 
+    // ---- Closest-surface query (CPU, two-way coupling contact detection) ----
+    // Result of closestTriangle(): the nearest triangle to a query point and the
+    // closest point on that triangle's surface.
+    struct ClosestSurface {
+        int   face = -1;            // index into the 'faces' passed to buildFromMesh (-1 if none)
+        PVec3 point{ 0.f, 0.f, 0.f }; // closest point on the surface
+    };
+
+    // Nearest triangle to p, using the same BVH built for the distance field
+    // (kept alive after buildFromMesh). Returns face = -1 if no mesh is built.
+    ClosestSurface closestTriangle(const PVec3& p) const;
+
 private:
     Eigen::Vector3d    _origin     = Eigen::Vector3d::Zero();  // world pos of voxel (0,0,0)
     double             _cellSize   = 0.0;
@@ -73,6 +88,11 @@ private:
     std::vector<float> _distances;                             // CPU grid, indexed by index()
 
     Texture3D          _texture;                               // GPU 3D texture (R32F)
+
+    // CPU triangle list + BVH, kept alive after the build so closestTriangle()
+    // can answer contact queries. Defined in the .cpp (holds .cpp-local types).
+    struct Accel;
+    std::shared_ptr<Accel> _accel;
 };
 
 #endif // SDF_BOUNDARY_H
