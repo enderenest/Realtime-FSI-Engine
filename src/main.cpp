@@ -314,9 +314,8 @@ static inline double msSince(PerfClock::time_point t0) {
     return std::chrono::duration<double, std::milli>(PerfClock::now() - t0).count();
 }
 
-static GLuint  g_anchorVAO = 0, g_anchorVBO = 0;
-static GLsizei g_anchorPtCount = 0;      // anchor points to draw
-static bool    g_prevLeftDown = false;   // edge-detect for anchor picking clicks
+static GLuint              g_meshColorVBO = 0;
+static std::vector<float>  g_meshColors;   // 3 floats per vertex (RGB), red for anchors
 
 static bool isAnchor(int v) {
     for (int a : g_anchors) if (a == v) return true;
@@ -419,13 +418,31 @@ static void uploadMeshAndSDF(const MeshData& m, PBFluids& fluid) {
     for (auto& fc : m.faces) { idx.push_back(fc[0]); idx.push_back(fc[1]); idx.push_back(fc[2]); }
     g_meshIdxCount = (GLsizei)idx.size();
 
+    // Default wireframe colour (warm yellow) for every vertex; anchors stay red
+    // after rebuildAnchorBuffer() is called (happens when Setup picks anchors).
+    const int nv = (int)m.verts.size();
+    g_meshColors.resize(nv * 3);
+    for (int i = 0; i < nv; ++i) {
+        g_meshColors[i*3+0] = 0.9f;
+        g_meshColors[i*3+1] = 0.8f;
+        g_meshColors[i*3+2] = 0.4f;
+    }
+
     glBindVertexArray(g_meshVAO);
+
     glBindBuffer(GL_ARRAY_BUFFER, g_meshVBO);
     glBufferData(GL_ARRAY_BUFFER, pos.size() * sizeof(float), pos.data(), GL_STATIC_DRAW);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_meshColorVBO);
+    glBufferData(GL_ARRAY_BUFFER, g_meshColors.size() * sizeof(float), g_meshColors.data(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_meshEBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * sizeof(unsigned), idx.data(), GL_STATIC_DRAW);
+
     glBindVertexArray(0);
 
     // Keep the mesh on the CPU (same world coords as the SDF/BVH) so two-way
@@ -672,17 +689,27 @@ static void buildDeformMeshFromData() {
         g_deformMesh.add_face(vh[f[0]], vh[f[1]], vh[f[2]]);
 }
 
-// Refresh the anchor-point buffer (green dots) from current deform-mesh positions.
+// Mark anchor vertices red in the per-vertex color VBO.
+// All other vertices stay at the default wireframe colour.
 static void rebuildAnchorBuffer() {
-    g_anchorPtCount = (GLsizei)g_anchors.size();
-    if (g_anchorPtCount == 0 || g_deformMesh.n_vertices() == 0) { g_anchorPtCount = 0; return; }
-    std::vector<float> pts; pts.reserve(g_anchors.size() * 3);
-    for (int a : g_anchors) {
-        auto p = g_deformMesh.point(MyMesh::VertexHandle(a));
-        pts.push_back((float)p[0]); pts.push_back((float)p[1]); pts.push_back((float)p[2]);
+    if (g_meshColors.empty() || g_meshColorVBO == 0) return;
+    const int n = (int)g_meshColors.size() / 3;
+    // Reset to default wireframe colour (warm yellow).
+    for (int i = 0; i < n; ++i) {
+        g_meshColors[i*3+0] = 0.9f;
+        g_meshColors[i*3+1] = 0.8f;
+        g_meshColors[i*3+2] = 0.4f;
     }
-    glBindBuffer(GL_ARRAY_BUFFER, g_anchorVBO);
-    glBufferData(GL_ARRAY_BUFFER, pts.size() * sizeof(float), pts.data(), GL_DYNAMIC_DRAW);
+    // Paint anchors red.
+    for (int a : g_anchors) {
+        if (a >= 0 && a < n) {
+            g_meshColors[a*3+0] = 1.0f;
+            g_meshColors[a*3+1] = 0.0f;
+            g_meshColors[a*3+2] = 0.0f;
+        }
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, g_meshColorVBO);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, g_meshColors.size() * sizeof(float), g_meshColors.data());
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
@@ -879,7 +906,7 @@ static void hardReset(PBFluids& fluid, const FluidConfig& fc) {
     g_anchors.clear();
     g_lastHandleSet.clear();
     g_restPositions.clear();
-    g_anchorPtCount = 0;
+
     g_arrowVertCount = 0;
     g_handleCount = 0;
 
@@ -956,9 +983,14 @@ int main() {
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(boxData), boxData);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    // ------ SDF mesh buffers (drawn with lineProg as wireframe) --
+    // ------ SDF mesh buffers (per-vertex colour, drawn as wireframe) --
+    GLuint meshProg = loadProgram(
+        RESOURCES_PATH "shaders/graphics/VS_Mesh.glsl",
+        RESOURCES_PATH "shaders/graphics/FS_Mesh.glsl");
+
     glGenVertexArrays(1, &g_meshVAO);
     glGenBuffers(1, &g_meshVBO);
+    glGenBuffers(1, &g_meshColorVBO);
     glGenBuffers(1, &g_meshEBO);
     scanOffAssets();
 
@@ -971,14 +1003,6 @@ int main() {
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
     glBindVertexArray(0);
 
-    // ------ Anchor-point buffers (Step 3, drawn with lineProg as GL_POINTS) --
-    glGenVertexArrays(1, &g_anchorVAO);
-    glGenBuffers(1, &g_anchorVBO);
-    glBindVertexArray(g_anchorVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, g_anchorVBO);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
-    glBindVertexArray(0);
 
     // Center camera on bounds
     g_camTarget = glm::vec3(
@@ -1042,7 +1066,6 @@ int main() {
         {
             const bool leftDown = (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS)
                                   && !ImGui::GetIO().WantCaptureMouse;
-            const bool leftPressed = leftDown && !g_prevLeftDown;   // rising edge
 
             glm::mat4 V = viewMatrix();
             float aspect = (float)g_winW / std::max((float)g_winH, 1.f);
@@ -1052,16 +1075,20 @@ int main() {
             PVec3 hitPos{ 0,0,0 };
 
             if (g_dstate == DeformState::Setup) {
-                // Toggle anchor vertices on the rest mesh by clicking.
-                if (leftPressed && g_deformMesh.n_vertices() > 0) {
+                // Continuous paint mode: hold and drag left mouse to add anchors.
+                // Rays are cast every frame while the button is held; a vertex is
+                // added on first hit and ignored on subsequent hits (no toggling
+                // off while dragging). Use "Clear Anchors" to remove.
+                if (leftDown && g_deformMesh.n_vertices() > 0) {
                     double mx, my; glfwGetCursorPos(window, &mx, &my);
                     Ray ray = screenToRay((float)mx, (float)my, g_winW, g_winH, V, P);
                     PickResult pr = pickVertex(ray, g_deformMesh);
                     if (pr.hit && pr.vertexIndex >= 0) {
                         auto it = std::find(g_anchors.begin(), g_anchors.end(), pr.vertexIndex);
-                        if (it == g_anchors.end()) g_anchors.push_back(pr.vertexIndex);
-                        else                       g_anchors.erase(it);
-                        rebuildAnchorBuffer();
+                        if (it == g_anchors.end()) {
+                            g_anchors.push_back(pr.vertexIndex);
+                            rebuildAnchorBuffer();  // only when a new anchor is added
+                        }
                     }
                 }
                 // (no fluid interaction while picking anchors)
@@ -1096,7 +1123,6 @@ int main() {
             }
 
             fluid.setInteraction(interacting, hitPos);
-            g_prevLeftDown = leftDown;
         }
 
         // ---- ImGui frame ----------------------------------------
@@ -1145,7 +1171,7 @@ int main() {
             g_anchors.clear();
             g_lastHandleSet.clear();
             g_restPositions.clear();
-            g_anchorPtCount = 0;
+        
             g_arrowVertCount = 0;
 
             // Scene-specific SDF setup: the container scene drops in a box that
@@ -1470,12 +1496,11 @@ int main() {
         glDrawArrays(GL_LINES, 0, 24);
         glBindVertexArray(0);
 
-        // ---- Draw SDF boundary mesh (wireframe) -----------------
+        // ---- Draw SDF boundary mesh (wireframe, per-vertex colour) --
         if (g_sdfEnabled && g_meshIdxCount > 0) {
             glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-            glUseProgram(lineProg);
-            glUniformMatrix4fv(glGetUniformLocation(lineProg, "VP"), 1, GL_FALSE, glm::value_ptr(VP));
-            glUniform3f(glGetUniformLocation(lineProg, "color"), 0.9f, 0.8f, 0.4f);
+            glUseProgram(meshProg);
+            glUniformMatrix4fv(glGetUniformLocation(meshProg, "VP"), 1, GL_FALSE, glm::value_ptr(VP));
             glBindVertexArray(g_meshVAO);
             glDrawElements(GL_TRIANGLES, g_meshIdxCount, GL_UNSIGNED_INT, nullptr);
             glBindVertexArray(0);
@@ -1492,18 +1517,6 @@ int main() {
             glBindVertexArray(0);
         }
 
-        // ---- Draw anchor points (Step 3) ------------------------
-        // lineProg has no gl_PointSize, so use fixed-function point size
-        // (GL_PROGRAM_POINT_SIZE must stay disabled for glPointSize to apply).
-        if (g_anchorPtCount > 0) {
-            glUseProgram(lineProg);
-            glUniformMatrix4fv(glGetUniformLocation(lineProg, "VP"), 1, GL_FALSE, glm::value_ptr(VP));
-            glUniform3f(glGetUniformLocation(lineProg, "color"), 0.2f, 1.0f, 0.3f);   // green anchors
-            glPointSize(12.0f);
-            glBindVertexArray(g_anchorVAO);
-            glDrawArrays(GL_POINTS, 0, g_anchorPtCount);
-            glBindVertexArray(0);
-        }
 
         // ---- ImGui overlay --------------------------------------
         ImGui::Render();
@@ -1522,13 +1535,13 @@ int main() {
     glDeleteBuffers(1, &boxVBO);
     glDeleteVertexArrays(1, &g_meshVAO);
     glDeleteBuffers(1, &g_meshVBO);
+    glDeleteBuffers(1, &g_meshColorVBO);
     glDeleteBuffers(1, &g_meshEBO);
     glDeleteVertexArrays(1, &g_arrowVAO);
     glDeleteBuffers(1, &g_arrowVBO);
-    glDeleteVertexArrays(1, &g_anchorVAO);
-    glDeleteBuffers(1, &g_anchorVBO);
     glDeleteProgram(particleProg);
     glDeleteProgram(lineProg);
+    glDeleteProgram(meshProg);
 
     glfwDestroyWindow(window);
     glfwTerminate();
