@@ -69,10 +69,12 @@ GLuint SSBO<T>::getID() const {
 
 // Explicit instantiations for our types
 #include "fluid/Particle.h"
-#include "core/Types.h" 
+#include "core/Types.h"
+#include "fluid/PBFluids.h"
 
 template class SSBO<Particle>;
 template class SSBO<PVec4>;
 template class SSBO<UVec2>;
 template class SSBO<IVec2>;
 template class SSBO<U32>;
+template class SSBO<ContactCandidate>;

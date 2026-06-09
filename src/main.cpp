@@ -220,7 +220,7 @@ struct MeshData {
 // ===================================================================
 static MeshData            g_meshData;          // current fitted mesh (same coords as SDF/BVH)
 static std::vector<PVec3>  g_vertForces;         // accumulated push force, per mesh vertex
-static std::vector<Particle> g_readback;         // scratch: GPU->CPU particle copy
+static std::vector<ContactCandidate> g_candidateList; // GPU-filtered near-surface particles
 static std::vector<float>  g_arrowVerts;         // scratch: arrow line-segment vertices (xyz)
 
 static bool   g_couplingEnabled  = false;        // master toggle for contact detection
@@ -486,20 +486,6 @@ static void loadContainerBox(PBFluids& fluid) {
 // Two-way coupling — Step 1 implementation
 // ===================================================================
 
-// Cheap nearest-voxel SDF lookup used only to reject particles that are clearly
-// far from the surface before paying for a BVH query. Returns a large value when
-// the point is outside the SDF grid.
-static float sampleSDFNearest(const PVec3& P) {
-    const Eigen::Vector3d& o   = g_sdf.origin();
-    const double           cs  = g_sdf.cellSize();
-    const Eigen::Vector3i& dim = g_sdf.dimensions();
-    const int ix = (int)std::lround((P.x - o.x()) / cs);
-    const int iy = (int)std::lround((P.y - o.y()) / cs);
-    const int iz = (int)std::lround((P.z - o.z()) / cs);
-    if (ix < 0 || iy < 0 || iz < 0 || ix >= dim.x() || iy >= dim.y() || iz >= dim.z())
-        return 1e30f;
-    return g_sdf.distances()[g_sdf.index(ix, iy, iz)];
-}
 
 // Barycentric coordinates (u,v,w) of point Pt with respect to triangle (A,B,C),
 // so Pt = u*A + v*B + w*C. Pt comes from closestPointOnTriangle, so it lies on
@@ -545,6 +531,12 @@ static void pushArrow(std::vector<float>& out, const PVec3& base, const PVec3& v
 
 // Detect contacts, distribute push forces onto mesh vertices by barycentric
 // weight, and rebuild the arrow buffer. No deformation — Step 1 + Step 2 only.
+//
+// Particle positions come from g_candidateList — a GPU-filtered compact list of
+// only the particles that were within contactBand of the SDF last frame (written
+// by fluid.filterContactCandidates(), called after fluid.step()).  This eliminates
+// the full-particle GPU->CPU readback and skips BVH queries for the vast majority
+// of particles that are never near the surface.
 static void computeContactForces(PBFluids& fluid) {
     const auto _tContacts = PerfClock::now();
     g_arrowVertCount = 0;
@@ -554,35 +546,34 @@ static void computeContactForces(PBFluids& fluid) {
     if (!g_sdf.valid() || g_meshData.verts.empty()) return;
 
     std::fill(g_vertForces.begin(), g_vertForces.end(), PVec3{ 0.f, 0.f, 0.f });
-    fluid.readbackParticles(g_readback);
 
-    const float band = g_contactRadius;
-    const float cell = (float)g_sdf.cellSize();
+    // Read back only near-surface candidates (GPU pre-filtered last frame).
+    fluid.readbackContactCandidates(g_candidateList);
 
-    // Parallel over particles. The shared g_sdf (BVH + voxel grid) and g_meshData
-    // are read-only here, so the only write hazard is the per-vertex force
-    // accumulation: each thread sums into a private buffer, then we reduce once.
-    const int nParticles = (int)g_readback.size();
-    const int nVerts     = (int)g_vertForces.size();
+    const float band     = g_contactRadius;
+    const int nCandidates = (int)g_candidateList.size();
+    const int nVerts      = (int)g_vertForces.size();
     int contactCount = 0;
 
+    // Parallel over candidates only — typically a small fraction of all particles.
+    // g_sdf (BVH) and g_meshData are read-only; per-vertex forces are thread-local.
     #pragma omp parallel
     {
         std::vector<PVec3> localForces(nVerts, PVec3{ 0.f, 0.f, 0.f });
         int localContacts = 0;
 
         #pragma omp for schedule(static) nowait
-        for (int pi = 0; pi < nParticles; ++pi) {
-            const Particle& pt = g_readback[pi];
-            const PVec3 P = pt.pos;
+        for (int pi = 0; pi < nCandidates; ++pi) {
+            const ContactCandidate& cand = g_candidateList[pi];
+            const PVec3 P   = { cand.pos.x, cand.pos.y, cand.pos.z };
+            const PVec3 vel = { cand.vel.x, cand.vel.y, cand.vel.z };
 
-            // Reject particles clearly away from the surface (cheap), then test exactly.
-            if (std::fabs(sampleSDFNearest(P)) > band + cell) continue;
-
+            // GPU already confirmed |sdf| < band; run the exact BVH query to get
+            // the closest surface point and triangle index for force distribution.
             const SDFBoundary::ClosestSurface cs = g_sdf.closestTriangle(P);
             if (cs.face < 0) continue;
 
-            const PVec3 toSurf = cs.point - P;    // points from the fluid into the surface
+            const PVec3 toSurf = cs.point - P;
             const float dist   = norm(toSurf);
             if (dist > band) continue;
 
@@ -605,8 +596,8 @@ static void computeContactForces(PBFluids& fluid) {
             // surface (grows with the push), or a flat 1.0 per contact.
             float mag = 1.0f;
             if (g_useVelMagnitude) {
-                mag = std::max(0.0f, dot(pt.vel, dir));
-                if (mag <= 0.0f) continue;        // not actually pressing inward
+                mag = std::max(0.0f, dot(vel, dir));
+                if (mag <= 0.0f) continue;
             }
 
             float u, v, w;
@@ -1407,6 +1398,11 @@ int main() {
             fluid.setCameraPos({ camPos.x, camPos.y, camPos.z });
 
             fluid.step();
+            // Dispatch the GPU contact pre-filter on the freshly integrated particles.
+            // The filter writes a compact candidate list; readbackContactCandidates()
+            // reads it at the TOP of the NEXT frame using the deferred fence, so this
+            // costs zero CPU stall time here.
+            if (wantContacts) fluid.filterContactCandidates(g_contactRadius);
             stepOnce = false;
         }
 

@@ -18,6 +18,8 @@ PBFluids::PBFluids(const FluidConfig& p)
     , _ssboHashGridAlt(0)
     , _ssboHistogram(0)
     , _ssboLOD(0)
+    , _ssboContactCount(0)
+    , _ssboContactCandidates(0)
     , _csPredictAndHash(RESOURCES_PATH "shaders/compute/CS_PredictAndHash.glsl")
 	, _csRadixHistogram(RESOURCES_PATH "shaders/compute/CS_RadixHistogram.glsl")
 	, _csRadixPrefixSum(RESOURCES_PATH "shaders/compute/CS_RadixPrefixSum.glsl")
@@ -29,6 +31,7 @@ PBFluids::PBFluids(const FluidConfig& p)
     , _csIntegrate(RESOURCES_PATH "shaders/compute/CS_Integrate.glsl")
     , _csVorticity(RESOURCES_PATH "shaders/compute/CS_VorticityConfinement.glsl")
     , _csComputeLOD(RESOURCES_PATH "shaders/compute/CS_ComputeLOD.glsl")
+    , _csContactFilter(RESOURCES_PATH "shaders/compute/CS_ContactFilter.glsl")
 {
     setParams(p);
 }
@@ -140,6 +143,12 @@ void PBFluids::setParticles(const std::vector<Particle>& particles)
 
     // APBF LOD buffer — 1 uint per particle
     initLODBuffer();
+
+    // Contact filter buffers: count (1 uint, cleared) + candidate list (N slots worst-case)
+    std::vector<U32> zeroCount(1, 0u);
+    _ssboContactCount.upload(zeroCount);
+    std::vector<ContactCandidate> emptyCandidates(N);
+    _ssboContactCandidates.upload(emptyCandidates);
 }
 
 void PBFluids::readbackParticles(std::vector<Particle>& out)
@@ -176,6 +185,99 @@ void PBFluids::readbackParticles(std::vector<Particle>& out)
                          static_cast<GLsizeiptr>(n * sizeof(Particle)), flags));
     if (src) {
         std::copy(src, src + n, out.data());
+        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    }
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+}
+
+void PBFluids::filterContactCandidates(float contactBand)
+{
+    if (!_sdf || !_sdf->valid() || contactBand <= 0.0f) return;
+    if (_ssboContactCandidates.count() == 0) return; // setParticles not called yet
+
+    const U32 N = _params.particleCount;
+
+    // Reset the atomic counter to 0.  A GL_BUFFER_UPDATE_BARRIER_BIT barrier
+    // makes this write visible to the subsequent compute dispatch.
+    U32 zero = 0u;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, _ssboContactCount.getID());
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(U32), &zero);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    // Bind all resources needed by the filter shader
+    _uboConfig.bindTo(0);
+    _ssboParticles.bindTo(0);
+    _ssboContactCount.bindTo(6);
+    _ssboContactCandidates.bindTo(8);
+
+    _sdf->bindForQuery(kSDFTextureUnit);
+    const Eigen::Vector3d& o   = _sdf->origin();
+    const Eigen::Vector3i& dim = _sdf->dimensions();
+
+    _csContactFilter.use();
+    _csContactFilter.setVec4("sdfOrigin",     (F32)o.x(), (F32)o.y(), (F32)o.z(), 0.0f);
+    _csContactFilter.setFloat("sdfCellSize",  (F32)_sdf->cellSize());
+    _csContactFilter.setVec4("sdfResolution", (F32)dim.x(), (F32)dim.y(), (F32)dim.z(), 0.0f);
+    _csContactFilter.setFloat("contactBand",  contactBand);
+
+    _csContactFilter.dispatch((N + 255u) / 256u);
+    // No wait() here: GL_SHADER_STORAGE_BARRIER_BIT orders GPU→GPU accesses on
+    // the same buffer, but nothing in this frame reads bindings 6 or 8 after the
+    // filter.  The fence below uses GL_SYNC_GPU_COMMANDS_COMPLETE, which signals
+    // only after ALL preceding GPU commands have finished and their effects are
+    // "fully realized" — that covers the candidate writes for the CPU map.
+
+    // Supersede any previous readback fence with one that also covers this filter
+    // dispatch.  readbackContactCandidates() (called at the TOP of the next frame)
+    // waits on it — by then the filter is already done, so the wait returns
+    // immediately and the map can be UNSYNCHRONIZED.
+    if (_readbackFence) glDeleteSync(_readbackFence);
+    _readbackFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+}
+
+void PBFluids::readbackContactCandidates(std::vector<ContactCandidate>& out)
+{
+    out.clear();
+    if (_ssboContactCandidates.count() == 0) return;
+
+    // Same deferred fence pattern as readbackParticles: called at the TOP of the
+    // frame before step(), so the fence from last frame's filterContactCandidates()
+    // is already signalled and the maps are UNSYNCHRONIZED (no CPU stall).
+    bool writesDone = false;
+    if (_readbackFence) {
+        const GLenum r = glClientWaitSync(_readbackFence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+        writesDone = (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED);
+        glDeleteSync(_readbackFence);
+        _readbackFence = nullptr;
+    }
+    // No glMemoryBarrier in the fallback path: GL_SHADER_STORAGE_BARRIER_BIT and
+    // GL_BUFFER_UPDATE_BARRIER_BIT order GPU→GPU commands inside the GL stream —
+    // they do not affect CPU visibility.  A synchronized map (no
+    // GL_MAP_UNSYNCHRONIZED_BIT) already stalls the CPU until all pending GPU
+    // operations on the buffer complete and the data is coherent.
+
+    const GLbitfield flags = GL_MAP_READ_BIT | (writesDone ? GL_MAP_UNSYNCHRONIZED_BIT : 0);
+
+    // Read the candidate count (1 uint)
+    U32 count = 0;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, _ssboContactCount.getID());
+    const U32* pCount = static_cast<const U32*>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(U32), flags));
+    if (pCount) { count = *pCount; glUnmapBuffer(GL_SHADER_STORAGE_BUFFER); }
+
+    // Clamp to the allocated buffer size — the shader guards this too, but belt + suspenders.
+    count = std::min(count, (U32)_ssboContactCandidates.count());
+
+    if (count == 0) { glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0); return; }
+
+    // Read the compact candidate list (positions + velocities only, no full Particle)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, _ssboContactCandidates.getID());
+    const ContactCandidate* src = static_cast<const ContactCandidate*>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0,
+                         static_cast<GLsizeiptr>(count * sizeof(ContactCandidate)), flags));
+    if (src) {
+        out.assign(src, src + count);
         glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
     }
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
@@ -380,8 +482,11 @@ void PBFluids::step()
     // SSBO stays on GPU — vertex shader reads directly from binding 0.
     // No CPU readback needed for rendering.
 
-    // Drop a fence on this step's GPU work so next frame's readbackParticles()
-    // can wait on it without draining the pipeline (see readbackParticles).
+    // Fallback fence: covers this step's GPU work.  When filterContactCandidates()
+    // is called right after (the normal case), it supersedes this fence with one
+    // that also covers the filter dispatch — so readbackContactCandidates() waits
+    // on the later fence.  When the filter is not dispatched (paused sim), this
+    // fence remains and readbackContactCandidates() uses it as-is.
     if (_readbackFence) glDeleteSync(_readbackFence);
     _readbackFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 }
