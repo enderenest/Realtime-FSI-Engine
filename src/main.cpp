@@ -275,6 +275,8 @@ static int   g_handleCount     = 0;       // active handles this frame
 // in badly on larger meshes and stalls analyze()/factorizeFull(). It needs a
 // fill-reducing reordering (AMD) before it is safe to enable on big meshes.
 // Until then the proven CHOLMOD soft solver (supernodal + AMD) is the default.
+static bool  g_useLocalDeform  = true;   // local patch solver (fast, default ON)
+static int   g_localKRing      = 3;      // geodesic ring radius for the patch
 static bool  g_useIncremental  = false;
 static bool  g_incVerify       = false;
 
@@ -850,6 +852,7 @@ static void confirmAnchorsAndSpawn(PBFluids& fluid, const FluidConfig& fc) {
     if (g_anchors.empty()) { std::cerr << "[Deform] Pick at least one anchor first.\n"; return; }
     g_deformer = std::make_unique<LaplacianDeformation>(g_deformMesh);
     g_deformer->initialize();                     // rest differential coords + normal system (once)
+    g_deformer->setUseLocal(g_useLocalDeform);
     g_deformer->setUseIncremental(g_useIncremental);
     for (int a : g_anchors) g_deformer->addAnchor(a);
     g_deformer->precomputeSystem();               // analyze (etree) + factorize with anchors only
@@ -1254,6 +1257,11 @@ int main() {
             // churned -> enable incremental (AMD) or widen the hysteresis gap.
             ImGui::Text("ms  contacts %.2f | refactor %.2f | solve %.2f | sdf %.2f | upload %.2f",
                         g_msContacts, g_msRefactor, g_msSolve, g_msSdfUpdate, g_msSdfUpload);
+            if (g_deformer && g_useLocalDeform) {
+                int ps = g_deformer->getLocalPatchSize();
+                if (ps > 0) ImGui::Text("patch interior: %d verts  (full mesh: %d)",
+                                        ps, (int)g_deformer->getMesh().n_vertices());
+            }
 
             const bool haveMesh = g_sdfEnabled && !g_meshData.verts.empty();
 
@@ -1291,6 +1299,21 @@ int main() {
 
             ImGui::Checkbox("restoring force (spring back to rest)", &g_restoreEnabled);
             ImGui::SliderFloat("restoreStrength", &g_restoreStrength, 0.0f, 0.5f, "%.3f");
+
+            // Local patch solver controls (live-togglable).
+            {
+                bool localChanged = ImGui::Checkbox("localPatch solver (fast)", &g_useLocalDeform);
+                ImGui::SameLine(); ImGui::TextDisabled("(OFF = full-mesh CHOLMOD)");
+                bool kChanged = false;
+                if (g_useLocalDeform)
+                    kChanged = ImGui::SliderInt("k-ring radius", &g_localKRing, 1, 8);
+                if ((localChanged || kChanged) && g_deformer) {
+                    g_deformer->setUseLocal(g_useLocalDeform);
+                    g_deformer->setLocalKRing(g_localKRing);
+                    // Force a precompute on the next frame by clearing the cached handle set.
+                    g_lastHandleSet.clear();
+                }
+            }
 
             // Hard reset: both solid and fluid back to their initial state.
             if (ImGui::Button("HARD RESET (mesh + fluid)")) {

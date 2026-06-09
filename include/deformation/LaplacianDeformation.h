@@ -3,6 +3,7 @@
 #include "core/Types.h"
 #include "deformation/IncrementalCholesky.h"
 #include <OpenMesh/Core/Mesh/PolyMesh_ArrayKernelT.hh>
+#include <unordered_map>
 #include <vector>
 
 typedef OpenMesh::PolyMesh_ArrayKernelT<> MyMesh;
@@ -32,6 +33,19 @@ public:
     // Execution
     void precomputeSystem();
     void solve();
+
+    // ---- Local patch mode (ON by default) ----
+    // Solves the Laplacian system only for the k-ring geodesic neighbourhood of
+    // the active handles instead of the full mesh. Reduces precompute from O(N^1.5)
+    // to O(k^1.5) where k is the small patch size (~50-200 vertices). Vertices
+    // outside the patch keep their current positions. When the handle set becomes
+    // empty the patch is disbanded and the mesh stays in its last deformed state
+    // until forces reappear (restoration is handled by the handle targets themselves
+    // gradually returning to rest via deformStep).
+    void setUseLocal(bool on) { _useLocal = on; }
+    bool isUsingLocal() const { return _useLocal; }
+    void setLocalKRing(int k) { _localKRing = k; }
+    int  getLocalPatchSize() const { return _local.ready ? (int)_local.interior.size() : 0; }
 
     // ---- Incremental Cholesky path (hard constraints, Eq.14 + Alg.3) ----
     // When enabled, precomputeSystem()/solve() use the persistent LDL^T factor
@@ -83,6 +97,34 @@ private:
     void computeCotangentWeights();
     void buildLaplacianMatrix();
     void computeDifferentialCoordinates();
+
+    // ---- Local patch state ----
+    bool _useLocal   = true;
+    int  _localKRing = 3;
+
+    struct LocalPatch {
+        std::vector<int>            interior;       // global vertex indices (solved)
+        std::vector<int>            notInteriorList;// global indices of fixed boundary neighbours
+        std::unordered_map<int,int> g2l;            // interior global → local
+        std::unordered_map<int,int> notI_g2l;       // notInterior global → local
+
+        ESparseMatrix Lii;      // ni × ni sub-Laplacian
+        ESparseMatrix Li_notI;  // ni × n_notI cross-term (boundary correction)
+        ESparseMatrix LiiT;     // transpose of Lii (precomputed for fast RHS)
+
+        EVecX restDX, restDY, restDZ;  // deltaX/Y/Z[interior] at REST pose
+
+        std::vector<int> localHandleIdx;   // local (interior) indices of handle vertices
+        std::vector<int> globalHandleIdx;  // corresponding global vertex indices
+
+        ESparseMatrix AtA;     // Lii^T Lii + diag(handles) — factorized normal equations
+        ELDLTSolver   solver;
+        bool ready = false;
+    } _local;
+
+    std::vector<int> extractKRing(const std::vector<int>& seeds, int k) const;
+    void precomputeLocalSystem();
+    void solveLocal();
 
     // ---- Incremental Cholesky state ----
     bool _useIncremental = false;
