@@ -148,13 +148,35 @@ void PBFluids::readbackParticles(std::vector<Particle>& out)
     out.resize(n);
     if (n == 0) return;
 
-    // Make the compute shaders' writes visible to the upcoming client-side map.
-    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+    // Non-stalling readback. Called at the TOP of the frame, before the next
+    // step(), so the only GPU work that has written the particle buffer is the
+    // PREVIOUS frame's step. We wait on that step's fence; a full frame of
+    // render/swap has elapsed, so it is already signalled and the wait returns
+    // immediately instead of draining the in-flight pipeline. With completion
+    // guaranteed we map UNSYNCHRONIZED, which also skips waiting on last frame's
+    // particle draw (a read — no hazard with our read). If the fence somehow has
+    // not signalled yet, we fall back to a synchronized map so data stays valid.
+    bool writesDone = false;
+    if (_readbackFence) {
+        const GLenum r = glClientWaitSync(_readbackFence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+        writesDone = (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED);
+        glDeleteSync(_readbackFence);
+        _readbackFence = nullptr;
+    }
+    if (!writesDone) {
+        // First readback (no fence yet) or rare not-ready case: make the writes
+        // visible and let the synchronized map below block as needed.
+        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+    }
 
-    const Particle* src = _ssboParticles.map(GL_READ_ONLY);
+    const GLbitfield flags = GL_MAP_READ_BIT | (writesDone ? GL_MAP_UNSYNCHRONIZED_BIT : 0);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, _ssboParticles.getID());
+    const Particle* src = static_cast<const Particle*>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0,
+                         static_cast<GLsizeiptr>(n * sizeof(Particle)), flags));
     if (src) {
         std::copy(src, src + n, out.data());
-        _ssboParticles.unmap();
+        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
     }
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 }
@@ -356,5 +378,10 @@ void PBFluids::step()
     }
 
     // SSBO stays on GPU — vertex shader reads directly from binding 0.
-    // No CPU readback needed.
+    // No CPU readback needed for rendering.
+
+    // Drop a fence on this step's GPU work so next frame's readbackParticles()
+    // can wait on it without draining the pipeline (see readbackParticles).
+    if (_readbackFence) glDeleteSync(_readbackFence);
+    _readbackFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 }

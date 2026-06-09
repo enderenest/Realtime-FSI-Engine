@@ -36,6 +36,7 @@
 #include <array>
 #include <filesystem>
 #include <memory>
+#include <chrono>
 
 // ===================================================================
 // Window / Camera state
@@ -284,6 +285,33 @@ static int   g_sdfSyncCounter      = 0;
 static int   g_sdfFullRebuildEvery = 100;  // N: tune later (CLAUDE.md Day 3)
 static float g_sdfDirtyBand        = 0.0f; // 0 => derive from padding; see syncDeformedMesh
 
+// Refresh the collision SDF only every Nth deform frame. The rendered mesh still
+// moves every frame; only the boundary the fluid samples lags by a couple frames,
+// which the SDF padding/band absorbs (per-frame moves are clamped to
+// g_maxDisplacement). This is the single biggest coupling-side cost cut on a
+// detailed mesh — the dirty recompute + BVH refit + texture upload no longer run
+// every frame. 1 == update every frame (old behaviour).
+static int   g_sdfUpdateEvery   = 3;
+static int   g_sdfUpdateCounter = 0;
+
+// Handle-set hysteresis. A vertex ENTERS the control set at the high threshold
+// and only LEAVES below the low one, so borderline vertices stop flickering in
+// and out. A stable set means precomputeSystem() (the per-frame refactor — full
+// CHOLMOD or incremental Alg.3) runs only on a real change; most frames are just
+// a re-solve. g_controlThreshold is the enter level; this is the (lower) exit.
+static float g_controlThresholdLow = 0.30f;
+
+// Per-phase timing (ms), shown in the overlay so we optimize the real bottleneck.
+static double g_msContacts  = 0.0;   // computeContactForces (readback + parallel scan)
+static double g_msRefactor  = 0.0;   // deformStep: setControlPoints + precomputeSystem
+static double g_msSolve     = 0.0;   // deformStep: solve()
+static double g_msSdfUpdate = 0.0;   // syncDeformedMesh: BVH refit + distance recompute
+static double g_msSdfUpload = 0.0;   // syncDeformedMesh: GPU texture upload
+using PerfClock = std::chrono::high_resolution_clock;
+static inline double msSince(PerfClock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(PerfClock::now() - t0).count();
+}
+
 static GLuint  g_anchorVAO = 0, g_anchorVBO = 0;
 static GLsizei g_anchorPtCount = 0;      // anchor points to draw
 static bool    g_prevLeftDown = false;   // edge-detect for anchor picking clicks
@@ -296,20 +324,51 @@ static bool isAnchor(int v) {
 static bool loadOFF(const std::string& path, MeshData& out) {
     std::ifstream f(path);
     if (!f) { std::cerr << "Cannot open: " << path << "\n"; return false; }
-    std::string header; f >> header;
-    if (header != "OFF") { std::cerr << "Not an OFF file: " << path << "\n"; return false; }
 
-    int numV, numF, numE; f >> numV >> numF >> numE;
+    // Skip comment lines (start with #) and blank lines before the header.
+    std::string header;
+    while (std::getline(f, header)) {
+        if (header.empty() || header[0] == '#') continue;
+        // trim trailing whitespace
+        while (!header.empty() && (header.back() == '\r' || header.back() == ' ')) header.pop_back();
+        break;
+    }
+    if (header.find("OFF") == std::string::npos) {
+        std::cerr << "Not an OFF file: " << path << "\n"; return false;
+    }
+
+    // Skip comment/blank lines before the counts line.
+    int numV = 0, numF = 0, numE = 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        if (ss >> numV >> numF >> numE) break;
+    }
+
+    // Read each vertex line in full; take only the first 3 values as XYZ.
+    // Some exporters embed normals/colors without updating the header tag,
+    // so flag-based skipping is unreliable — reading the whole line is safer.
     out.verts.resize(numV);
-    for (int i = 0; i < numV; ++i)
-        f >> out.verts[i][0] >> out.verts[i][1] >> out.verts[i][2];
+    for (int i = 0; i < numV; ++i) {
+        while (std::getline(f, line)) {
+            if (!line.empty() && line[0] != '#') break;
+        }
+        std::istringstream ss(line);
+        ss >> out.verts[i][0] >> out.verts[i][1] >> out.verts[i][2];
+        // remaining values on the line (normals, colors, texcoords) are ignored
+    }
 
     out.faces.clear(); out.faces.reserve(numF);
     for (int i = 0; i < numF; ++i) {
-        int n; f >> n;
+        while (std::getline(f, line)) {
+            if (!line.empty() && line[0] != '#') break;
+        }
+        std::istringstream ss(line);
+        int n; ss >> n;
         std::vector<int> poly(n);
-        for (int j = 0; j < n; ++j) f >> poly[j];
-        for (int j = 1; j + 1 < n; ++j)            // fan triangulation
+        for (int j = 0; j < n; ++j) ss >> poly[j];
+        for (int j = 1; j + 1 < n; ++j)        // fan triangulation
             out.faces.push_back({ poly[0], poly[j], poly[j + 1] });
     }
     return true;
@@ -487,9 +546,11 @@ static void pushArrow(std::vector<float>& out, const PVec3& base, const PVec3& v
 // Detect contacts, distribute push forces onto mesh vertices by barycentric
 // weight, and rebuild the arrow buffer. No deformation — Step 1 + Step 2 only.
 static void computeContactForces(PBFluids& fluid) {
+    const auto _tContacts = PerfClock::now();
     g_arrowVertCount = 0;
     g_contactCount   = 0;
     g_controlCount   = 0;
+    g_msContacts     = 0.0;
     if (!g_sdf.valid() || g_meshData.verts.empty()) return;
 
     std::fill(g_vertForces.begin(), g_vertForces.end(), PVec3{ 0.f, 0.f, 0.f });
@@ -498,52 +559,74 @@ static void computeContactForces(PBFluids& fluid) {
     const float band = g_contactRadius;
     const float cell = (float)g_sdf.cellSize();
 
-    for (const Particle& pt : g_readback) {
-        const PVec3 P = pt.pos;
+    // Parallel over particles. The shared g_sdf (BVH + voxel grid) and g_meshData
+    // are read-only here, so the only write hazard is the per-vertex force
+    // accumulation: each thread sums into a private buffer, then we reduce once.
+    const int nParticles = (int)g_readback.size();
+    const int nVerts     = (int)g_vertForces.size();
+    int contactCount = 0;
 
-        // Reject particles clearly away from the surface (cheap), then test exactly.
-        if (std::fabs(sampleSDFNearest(P)) > band + cell) continue;
+    #pragma omp parallel
+    {
+        std::vector<PVec3> localForces(nVerts, PVec3{ 0.f, 0.f, 0.f });
+        int localContacts = 0;
 
-        const SDFBoundary::ClosestSurface cs = g_sdf.closestTriangle(P);
-        if (cs.face < 0) continue;
+        #pragma omp for schedule(static) nowait
+        for (int pi = 0; pi < nParticles; ++pi) {
+            const Particle& pt = g_readback[pi];
+            const PVec3 P = pt.pos;
 
-        const PVec3 toSurf = cs.point - P;        // points from the fluid into the surface
-        const float dist   = norm(toSurf);
-        if (dist > band) continue;
+            // Reject particles clearly away from the surface (cheap), then test exactly.
+            if (std::fabs(sampleSDFNearest(P)) > band + cell) continue;
 
-        const std::array<int, 3>& f = g_meshData.faces[cs.face];
-        const EVec3 A(g_meshData.verts[f[0]][0], g_meshData.verts[f[0]][1], g_meshData.verts[f[0]][2]);
-        const EVec3 B(g_meshData.verts[f[1]][0], g_meshData.verts[f[1]][1], g_meshData.verts[f[1]][2]);
-        const EVec3 C(g_meshData.verts[f[2]][0], g_meshData.verts[f[2]][1], g_meshData.verts[f[2]][2]);
+            const SDFBoundary::ClosestSurface cs = g_sdf.closestTriangle(P);
+            if (cs.face < 0) continue;
 
-        // Push direction: into the surface. Use particle->surface when well-defined,
-        // else the inward face normal (faces are oriented outward, so negate).
-        PVec3 dir;
-        if (dist > 1e-6f) {
-            dir = toSurf * (1.0f / dist);
-        } else {
-            const EVec3 n = (B - A).cross(C - A).normalized();
-            dir = toPlain(-n);
+            const PVec3 toSurf = cs.point - P;    // points from the fluid into the surface
+            const float dist   = norm(toSurf);
+            if (dist > band) continue;
+
+            const std::array<int, 3>& f = g_meshData.faces[cs.face];
+            const EVec3 A(g_meshData.verts[f[0]][0], g_meshData.verts[f[0]][1], g_meshData.verts[f[0]][2]);
+            const EVec3 B(g_meshData.verts[f[1]][0], g_meshData.verts[f[1]][1], g_meshData.verts[f[1]][2]);
+            const EVec3 C(g_meshData.verts[f[2]][0], g_meshData.verts[f[2]][1], g_meshData.verts[f[2]][2]);
+
+            // Push direction: into the surface. Use particle->surface when well-defined,
+            // else the inward face normal (faces are oriented outward, so negate).
+            PVec3 dir;
+            if (dist > 1e-6f) {
+                dir = toSurf * (1.0f / dist);
+            } else {
+                const EVec3 n = (B - A).cross(C - A).normalized();
+                dir = toPlain(-n);
+            }
+
+            // Magnitude: how hard the fluid presses. Velocity component into the
+            // surface (grows with the push), or a flat 1.0 per contact.
+            float mag = 1.0f;
+            if (g_useVelMagnitude) {
+                mag = std::max(0.0f, dot(pt.vel, dir));
+                if (mag <= 0.0f) continue;        // not actually pressing inward
+            }
+
+            float u, v, w;
+            const EVec3 Pt(cs.point.x, cs.point.y, cs.point.z);
+            barycentric(Pt, A, B, C, u, v, w);
+
+            const PVec3 force = dir * mag;
+            localForces[f[0]] += force * u;
+            localForces[f[1]] += force * v;
+            localForces[f[2]] += force * w;
+            ++localContacts;
         }
 
-        // Magnitude: how hard the fluid presses. Velocity component into the
-        // surface (grows with the push), or a flat 1.0 per contact.
-        float mag = 1.0f;
-        if (g_useVelMagnitude) {
-            mag = std::max(0.0f, dot(pt.vel, dir));
-            if (mag <= 0.0f) continue;            // not actually pressing inward
+        #pragma omp critical
+        {
+            for (int k = 0; k < nVerts; ++k) g_vertForces[k] += localForces[k];
+            contactCount += localContacts;
         }
-
-        float u, v, w;
-        const EVec3 Pt(cs.point.x, cs.point.y, cs.point.z);
-        barycentric(Pt, A, B, C, u, v, w);
-
-        const PVec3 force = dir * mag;
-        g_vertForces[f[0]] += force * u;
-        g_vertForces[f[1]] += force * v;
-        g_vertForces[f[2]] += force * w;
-        ++g_contactCount;
     }
+    g_contactCount = contactCount;
 
     // Build the arrow line buffer and count control points (threshold crossings).
     g_arrowVerts.clear();
@@ -565,6 +648,7 @@ static void computeContactForces(PBFluids& fluid) {
                      g_arrowVerts.data(), GL_DYNAMIC_DRAW);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
     }
+    g_msContacts = msSince(_tContacts);
 }
 
 // ===================================================================
@@ -620,23 +704,48 @@ static void syncDeformedMesh(PBFluids& fluid) {
         auto p = g_deformMesh.point(MyMesh::VertexHandle(i));
         g_meshData.verts[i] = { p[0], p[1], p[2] };
     }
-    updateMeshVBO();
+    updateMeshVBO();        // rendered mesh moves every frame (cheap sub-data upload)
     rebuildAnchorBuffer();
 
+    g_msSdfUpdate = 0.0;
+    g_msSdfUpload = 0.0;
+
+    // Refresh the COLLISION SDF only every Nth deform frame. The fluid then
+    // samples a boundary that lags a couple frames, absorbed by the SDF padding;
+    // per-frame moves are clamped to g_maxDisplacement so it cannot leak. This is
+    // the main coupling-side cut on a detailed mesh — refit + dirty recompute +
+    // upload no longer run every frame.
+    const int every = std::max(1, g_sdfUpdateEvery);
+    if (g_sdfUpdateCounter++ % every != 0) {
+        fluid.setSDFBoundary(&g_sdf);
+        fluid.setSDFPadding(g_sdfPadding);
+        fluid.setSDFContainment(g_sdfContainer);
+        return;
+    }
+
+    const auto _tUpd = PerfClock::now();
     const bool fullRebuild = (g_sdfSyncCounter++ % g_sdfFullRebuildEvery == 0);
     if (fullRebuild || !g_sdf.valid()) {
         g_sdf.buildFromMesh(g_meshData.verts, g_meshData.faces, g_sdfCell, /*verbose=*/false);
+        g_msSdfUpdate = msSince(_tUpd);
+        const auto _tUp = PerfClock::now();
         g_sdf.uploadToGPU();
+        g_msSdfUpload = msSince(_tUp);
     } else {
-        // Dirty band must cover the shell the shader actually samples (padding)
-        // plus this frame's largest possible move, plus a cell of slack. Old AND
-        // new positions are marked inside refitDirty, so a clamped per-frame move
-        // is fully contained.
+        // Dirty band must cover the shell the shader samples (padding) plus the
+        // largest move SINCE THE LAST SDF REFRESH (every * per-frame clamp), plus
+        // a cell of slack. refitDirty marks old AND new positions, so the moved
+        // corridor stays fully contained even across skipped frames.
         const double band       = (g_sdfDirtyBand > 0.0f ? (double)g_sdfDirtyBand
                                                           : std::max((double)g_sdfPadding, 2.0 * g_sdf.cellSize()));
-        const double bandRadius = band + (double)g_maxDisplacement + g_sdf.cellSize();
-        if (g_sdf.refitDirty(g_meshData.verts, bandRadius, /*moveEps=*/1e-4))
+        const double bandRadius = band + (double)every * (double)g_maxDisplacement + g_sdf.cellSize();
+        const bool   dirty      = g_sdf.refitDirty(g_meshData.verts, bandRadius, /*moveEps=*/1e-4);
+        g_msSdfUpdate = msSince(_tUpd);
+        if (dirty) {
+            const auto _tUp = PerfClock::now();
             g_sdf.uploadDirtyRegion();
+            g_msSdfUpload = msSince(_tUp);
+        }
     }
 
     fluid.setSDFBoundary(&g_sdf);
@@ -673,11 +782,17 @@ static void deformStep(PBFluids& fluid, float dt) {
         const EVec3 cur  = EVec3(p[0], p[1], p[2]);
         const EVec3 rest = g_restPositions[i];
 
-        const bool  pushed   = norm(g_vertForces[i]) >= g_controlThreshold;
+        const float fmag    = norm(g_vertForces[i]);
+        const bool  wasH    = wasHandle(i);
+        // Hysteresis: a vertex ENTERS the control set at the high threshold and
+        // only LEAVES below the low one. This stops borderline vertices flickering
+        // in/out, which is what forced a refactor (precomputeSystem) every frame.
+        const bool  pushed   = (fmag >= g_controlThreshold)
+                            || (wasH && fmag >= g_controlThresholdLow);
         const double offset  = (cur - rest).norm();
         // Keep relaxing only vertices we were already controlling, so the solve's
         // free neighbours don't all get promoted to handles.
-        const bool  relaxing = g_restoreEnabled && wasHandle(i) && offset > 1e-3;
+        const bool  relaxing = g_restoreEnabled && wasH && offset > 1e-3;
         if (!pushed && !relaxing) continue;
 
         EVec3 target = cur;
@@ -706,8 +821,11 @@ static void deformStep(PBFluids& fluid, float dt) {
 
     const bool setChanged = (handles != g_lastHandleSet);
     g_deformer->setControlPoints(handles, targets);
+    g_msRefactor = 0.0;
     if (setChanged) {
+        const auto _t = PerfClock::now();
         g_deformer->precomputeSystem();               // SET changed -> Alg.3 update (or refactor)
+        g_msRefactor = msSince(_t);
         ++g_refactorCount;
         if (g_incVerify) g_deformer->verifyIncremental();
     }
@@ -715,8 +833,11 @@ static void deformStep(PBFluids& fluid, float dt) {
 
     // Solve when there are active constraints, or exactly once more right after the
     // set empties (so the mesh settles cleanly back to its rest shape).
+    g_msSolve = 0.0;
     if (!handles.empty() || setChanged) {
+        const auto _t = PerfClock::now();
         g_deformer->solve();
+        g_msSolve = msSince(_t);
         syncDeformedMesh(fluid);
     }
 }
@@ -1076,14 +1197,14 @@ int main() {
         bool spawnDirty = false;
         spawnDirty |= ImGui::Checkbox("spawnRandom", &cfg.fluid.spawnRandom);
         spawnDirty |= ImGui::SliderFloat("spacing", &cfg.fluid.spacing, 0.005f, 0.15f);
-        spawnDirty |= ImGui::SliderFloat3("spawnMin", &cfg.fluid.spawnMin.x, 0.0f, 6.f);
-        spawnDirty |= ImGui::SliderFloat3("spawnMax", &cfg.fluid.spawnMax.x, 0.0f, 6.f);
+        spawnDirty |= ImGui::SliderFloat3("spawnMin", &cfg.fluid.spawnMin.x, -10.f, 10.f);
+        spawnDirty |= ImGui::SliderFloat3("spawnMax", &cfg.fluid.spawnMax.x, -10.f, 10.f);
         spawnDirty |= ImGui::SliderFloat3("initialVel", &cfg.fluid.initialVelocity.x, -5.f, 5.f);
 
         ImGui::Separator(); ImGui::Text("Bounds (AABB)");
         bool boundsDirty = false;
-        boundsDirty |= ImGui::SliderFloat3("boundsMin", &cfg.fluid.boundsMin.x, 0.0f, 30.f);
-        boundsDirty |= ImGui::SliderFloat3("boundsMax", &cfg.fluid.boundsMax.x, 0.f, 30.f);
+        boundsDirty |= ImGui::SliderFloat3("boundsMin", &cfg.fluid.boundsMin.x, -20.0f, 20.f);
+        boundsDirty |= ImGui::SliderFloat3("boundsMax", &cfg.fluid.boundsMax.x, -20.0f, 20.f);
         boundsDirty |= ImGui::SliderFloat("boundDamping", &cfg.fluid.boundDamping, 0.f, 1.f);
 
         ImGui::Separator(); ImGui::Text("SDF Boundary");
@@ -1096,6 +1217,7 @@ int main() {
             fluid.setSDFPadding(g_sdfPadding);
         ImGui::SliderFloat("sdfMeshSize", &g_sdfMeshSize, 0.5f, 20.0f);
         ImGui::SliderFloat("sdfCell", &g_sdfCell, 0.04f, 0.25f, "%.3f");
+        ImGui::SliderInt("sdfUpdateEvery (collision refresh)", &g_sdfUpdateEvery, 1, 8);
         {
             const char* preview = (g_selFile >= 0 && g_selFile < (int)g_offFiles.size())
                 ? g_offFiles[g_selFile].c_str() : "Load .off mesh...";
@@ -1120,7 +1242,9 @@ int main() {
         ImGui::SliderFloat("contactRadius", &g_contactRadius, 0.01f, 0.5f, "%.3f");
         ImGui::Checkbox("magnitude = velocity into surface", &g_useVelMagnitude);
         ImGui::SliderFloat("arrowScale", &g_forceScale, 0.01f, 3.0f, "%.3f");
-        ImGui::SliderFloat("controlThreshold (handle threshold)", &g_controlThreshold, 0.0f, 5.0f, "%.3f");
+        ImGui::SliderFloat("controlThreshold (handle enter)", &g_controlThreshold, 0.0f, 5.0f, "%.3f");
+        ImGui::SliderFloat("controlThresholdLow (handle exit)", &g_controlThresholdLow, 0.0f, 5.0f, "%.3f");
+        if (g_controlThresholdLow > g_controlThreshold) g_controlThresholdLow = g_controlThreshold;
         ImGui::Text("contacts: %d   control pts: %d", g_contactCount, g_controlCount);
 
         ImGui::Separator(); ImGui::Text("Deformation (Step 3: anchors -> handles)");
@@ -1132,6 +1256,13 @@ int main() {
                 g_dstate == DeformState::Running  ? "Running" : "Paused";
             ImGui::Text("state: %s   anchors: %d   handles: %d   refactors: %d",
                         stateName, (int)g_anchors.size(), g_handleCount, g_refactorCount);
+
+            // Per-phase timing of the coupling hot path. The biggest number is the
+            // bottleneck to attack next. refactor==0 most frames means the handle
+            // set is stable (hysteresis working); a big refactor means the set
+            // churned -> enable incremental (AMD) or widen the hysteresis gap.
+            ImGui::Text("ms  contacts %.2f | refactor %.2f | solve %.2f | sdf %.2f | upload %.2f",
+                        g_msContacts, g_msRefactor, g_msSolve, g_msSdfUpdate, g_msSdfUpload);
 
             const bool haveMesh = g_sdfEnabled && !g_meshData.verts.empty();
 
@@ -1195,7 +1326,7 @@ int main() {
 
         ImGui::Separator(); ImGui::Text("Mouse Interaction");
         solverDirty |= ImGui::SliderFloat("interactionRadius", &cfg.fluid.interactionRadius, 0.1f, 5.0f);
-        solverDirty |= ImGui::SliderFloat("interactionStrength", &cfg.fluid.interactionStrength, -30.0f, 30.0f);
+        solverDirty |= ImGui::SliderFloat("interactionStrength", &cfg.fluid.interactionStrength, -20.0f, 20.0f);
 
         ImGui::Separator(); ImGui::Text("Viscosity");
         bool viscDirty = false;
@@ -1246,6 +1377,22 @@ int main() {
             respawn = false;
         }
 
+        // ---- Two-way coupling: contacts (Step 1) + deform (Step 3) ----
+        // Runs BEFORE fluid.step() on purpose. computeContactForces reads the
+        // particle buffer the GPU finished during the PREVIOUS frame, so the
+        // readback no longer blocks the CPU waiting on the step we are about to
+        // issue — that hard sync was the 100->30 FPS stall. As a bonus, deform
+        // updates the SDF before step() samples it, so the fluid collides
+        // against the latest shape. One-frame contact latency, invisible here.
+        // Contacts are needed when visualizing arrows OR when Running (handles
+        // come from these forces). Deformation runs only in the Running state.
+        const bool wantContacts = g_sdfEnabled &&
+                                  (g_couplingEnabled || g_dstate == DeformState::Running);
+        if (wantContacts) computeContactForces(fluid);
+        else              g_arrowVertCount = 0;
+
+        if (g_dstate == DeformState::Running) deformStep(fluid, cfg.fluid.dt);
+
         // ---- Simulation step (GPU only) -------------------------
         // Inactive (legacy): driven by the paused/Step controls.
         // Deformation states: only Running advances the fluid.
@@ -1262,16 +1409,6 @@ int main() {
             fluid.step();
             stepOnce = false;
         }
-
-        // ---- Two-way coupling: contacts (Step 1) + deform (Step 3) ----
-        // Contacts are needed when visualizing arrows OR when Running (handles
-        // come from these forces). Deformation runs only in the Running state.
-        const bool wantContacts = g_sdfEnabled &&
-                                  (g_couplingEnabled || g_dstate == DeformState::Running);
-        if (wantContacts) computeContactForces(fluid);
-        else              g_arrowVertCount = 0;
-
-        if (g_dstate == DeformState::Running) deformStep(fluid, cfg.fluid.dt);
 
         // ---- Clear -----------------------------------------------
         glClearColor(0.2f, 0.2f, 0.2f, 1.0f);

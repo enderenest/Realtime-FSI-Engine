@@ -208,6 +208,13 @@ private:
     PVec3 _cameraPos{ 0, 0, 0 };
     void initLODBuffer();
 
+    // Fence signalled at the end of step(). readbackParticles() (called at the
+    // TOP of the next frame, before the next step) waits on it — by then it is
+    // already signalled, so the wait returns immediately and the map can be
+    // UNSYNCHRONIZED, letting contact detection read last frame's particles
+    // without stalling the CPU on the pipeline.
+    GLsync _readbackFence = nullptr;
+
     // SDF solid boundary (non-owning). Queried in CS_Integrate via sampler3D
     // bound to texture unit kSDFTextureUnit.
     const SDFBoundary* _sdf = nullptr;
