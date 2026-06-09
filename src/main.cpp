@@ -265,6 +265,25 @@ static float g_restoreStrength = 0.05f;   // fraction of the remaining offset re
 static int   g_refactorCount   = 0;       // diagnostics: factorizations this run
 static int   g_handleCount     = 0;       // active handles this frame
 
+// Incremental Cholesky (hard constraints, Eq.14 + Alg.3). When on, a handle-set
+// change updates the persistent factor along elimination-tree paths instead of
+// refactoring; a targets-only frame just re-solves. g_incVerify compares each
+// rebuild against a fresh Eigen factorization (slow; debugging only).
+//
+// OFF by default: the current engine factors with NATURAL ordering, which fills
+// in badly on larger meshes and stalls analyze()/factorizeFull(). It needs a
+// fill-reducing reordering (AMD) before it is safe to enable on big meshes.
+// Until then the proven CHOLMOD soft solver (supernodal + AMD) is the default.
+static bool  g_useIncremental  = false;
+static bool  g_incVerify       = false;
+
+// SDF/BVH update cadence (two-way coupling): dirty (local) update most frames,
+// full rebuild every Nth to reset accumulated drift. Shared counter so the BVH
+// rebuild and the SDF full rebuild fire on the same frame.
+static int   g_sdfSyncCounter      = 0;
+static int   g_sdfFullRebuildEvery = 100;  // N: tune later (CLAUDE.md Day 3)
+static float g_sdfDirtyBand        = 0.0f; // 0 => derive from padding; see syncDeformedMesh
+
 static GLuint  g_anchorVAO = 0, g_anchorVBO = 0;
 static GLsizei g_anchorPtCount = 0;      // anchor points to draw
 static bool    g_prevLeftDown = false;   // edge-detect for anchor picking clicks
@@ -590,8 +609,12 @@ static void rebuildAnchorBuffer() {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
-// After a solve: deform mesh -> g_meshData -> GL wireframe -> SDF/BVH rebuild +
+// After a solve: deform mesh -> g_meshData -> GL wireframe -> SDF/BVH update +
 // GPU upload, so the fluid collides against the new shape next frame.
+//
+// Most frames: dirty update (refit BVH + recompute only the voxels near moved
+// vertices + partial texture upload). Every Nth frame: full rebuild to reset any
+// accumulated drift at dirty-region boundaries (CLAUDE.md Day 2 stability note).
 static void syncDeformedMesh(PBFluids& fluid) {
     for (int i = 0; i < (int)g_meshData.verts.size(); ++i) {
         auto p = g_deformMesh.point(MyMesh::VertexHandle(i));
@@ -599,8 +622,23 @@ static void syncDeformedMesh(PBFluids& fluid) {
     }
     updateMeshVBO();
     rebuildAnchorBuffer();
-    g_sdf.buildFromMesh(g_meshData.verts, g_meshData.faces, g_sdfCell, /*verbose=*/false);
-    g_sdf.uploadToGPU();
+
+    const bool fullRebuild = (g_sdfSyncCounter++ % g_sdfFullRebuildEvery == 0);
+    if (fullRebuild || !g_sdf.valid()) {
+        g_sdf.buildFromMesh(g_meshData.verts, g_meshData.faces, g_sdfCell, /*verbose=*/false);
+        g_sdf.uploadToGPU();
+    } else {
+        // Dirty band must cover the shell the shader actually samples (padding)
+        // plus this frame's largest possible move, plus a cell of slack. Old AND
+        // new positions are marked inside refitDirty, so a clamped per-frame move
+        // is fully contained.
+        const double band       = (g_sdfDirtyBand > 0.0f ? (double)g_sdfDirtyBand
+                                                          : std::max((double)g_sdfPadding, 2.0 * g_sdf.cellSize()));
+        const double bandRadius = band + (double)g_maxDisplacement + g_sdf.cellSize();
+        if (g_sdf.refitDirty(g_meshData.verts, bandRadius, /*moveEps=*/1e-4))
+            g_sdf.uploadDirtyRegion();
+    }
+
     fluid.setSDFBoundary(&g_sdf);
     fluid.setSDFPadding(g_sdfPadding);
     fluid.setSDFContainment(g_sdfContainer);
@@ -669,8 +707,9 @@ static void deformStep(PBFluids& fluid, float dt) {
     const bool setChanged = (handles != g_lastHandleSet);
     g_deformer->setControlPoints(handles, targets);
     if (setChanged) {
-        g_deformer->precomputeSystem();               // constrained SET changed -> refactor
+        g_deformer->precomputeSystem();               // SET changed -> Alg.3 update (or refactor)
         ++g_refactorCount;
+        if (g_incVerify) g_deformer->verifyIncremental();
     }
     g_lastHandleSet = handles;
 
@@ -698,9 +737,10 @@ static void enterSetup(PBFluids& fluid) {
 static void confirmAnchorsAndSpawn(PBFluids& fluid, const FluidConfig& fc) {
     if (g_anchors.empty()) { std::cerr << "[Deform] Pick at least one anchor first.\n"; return; }
     g_deformer = std::make_unique<LaplacianDeformation>(g_deformMesh);
-    g_deformer->initialize();                     // rest differential coordinates (once)
+    g_deformer->initialize();                     // rest differential coords + normal system (once)
+    g_deformer->setUseIncremental(g_useIncremental);
     for (int a : g_anchors) g_deformer->addAnchor(a);
-    g_deformer->precomputeSystem();               // factorization with anchors only
+    g_deformer->precomputeSystem();               // analyze (etree) + factorize with anchors only
     ++g_refactorCount;
     g_lastHandleSet.clear();
 
@@ -1128,7 +1168,7 @@ int main() {
             ImGui::SliderFloat("maxTotalDisplacement", &g_maxTotalDisp, 0.01f, 2.0f, "%.3f");
 
             ImGui::Checkbox("restoring force (spring back to rest)", &g_restoreEnabled);
-            ImGui::SliderFloat("restoreStrength", &g_restoreStrength, 0.001f, 0.5f, "%.3f");
+            ImGui::SliderFloat("restoreStrength", &g_restoreStrength, 0.0f, 0.5f, "%.3f");
 
             // Hard reset: both solid and fluid back to their initial state.
             if (ImGui::Button("HARD RESET (mesh + fluid)")) {

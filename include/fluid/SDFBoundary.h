@@ -2,6 +2,7 @@
 #define SDF_BOUNDARY_H
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -61,12 +62,40 @@ public:
     // retighten the BVH. Caller must uploadToGPU() afterwards, as with build.
     void refitFromMesh(const std::vector<std::array<double, 3>>& verts);
 
+    // ---- Dirty (local) deformation update (two-way coupling, most frames) ----
+    // Like refitFromMesh, but recomputes only the voxels near vertices that
+    // actually moved instead of the whole grid. Steps:
+    //   1. Detect moved vertices: ||newVerts[i] - lastVerts[i]|| > moveEps.
+    //      (Laplacian/ARAP deformation is global but decays fast, so this set is
+    //       small in practice — measured, not assumed-local.)
+    //   2. Mark dirty voxels within bandRadius of BOTH the old and new position
+    //      of each moved vertex (old clears the stale surface, new writes it).
+    //   3. Refit the BVH (O(F)) and recompute signed distance for dirty voxels.
+    // Records the dirty voxel bounding box for uploadDirtyRegion(). Returns true
+    // if anything was dirty (i.e. an upload is needed). Falls back to a full
+    // refitFromMesh if no baseline exists yet (first call / size mismatch).
+    //
+    // bandRadius (world units): pass bandWidth + maxDisplacement + cellSize.
+    // Pair with a periodic full buildFromMesh() to reset accumulated drift.
+    bool refitDirty(const std::vector<std::array<double, 3>>& newVerts,
+                    double bandRadius, double moveEps);
+
+    // Debug aid for the dirty path: after each refitDirty, recompute the full
+    // grid and assert the dirty voxels match it (the "match where they overlap"
+    // check). Off by default; doubles the work when on.
+    void setDebugVerifyDirty(bool on) { _debugVerifyDirty = on; }
+
     // ---- GPU upload ----
     // Repacks the CPU grid into texture order and uploads it as an R32F volume.
     // Requires a current GL context. Call once after building, and again after
     // a local rebuild when the mesh deforms (re-uploads in place if the
     // dimensions are unchanged).
     void uploadToGPU();
+
+    // Upload only the dirty voxel bounding box recorded by the last refitDirty()
+    // via glTexSubImage3D, instead of re-pushing the whole volume. No-op if the
+    // last update marked nothing dirty. Requires a current GL context.
+    void uploadDirtyRegion();
 
     // Bind the SDF texture to a sampler image unit for the query shader.
     void bindForQuery(GLuint textureUnit) const { _texture.bindToUnit(textureUnit); }
@@ -103,11 +132,33 @@ private:
 
     Texture3D          _texture;                               // GPU 3D texture (R32F)
 
+    // Signed distance at a world point P: nearest surface point via the BVH,
+    // sign from the pseudo-normal of the closest feature. The single-voxel
+    // kernel shared by the full grid pass and the dirty pass.
+    float signedDistanceAt(const Eigen::Vector3d& P) const;
+
     // Fills _distances by querying the retained BVH at every voxel center.
     // Shared by buildFromMesh (after a fresh build) and refitFromMesh (after a
     // refit). Reads geometry + pseudo-normals from _accel; respects _origin,
     // _cellSize, _dimensions (all set before it is called).
     void recomputeDistances();
+
+    // Pulls moved vertex positions into the retained triangles, refreshes face
+    // normals, and refits the BVH in place. The geometry half of refitFromMesh /
+    // refitDirty (does NOT touch the distance grid).
+    void updateGeometryAndRefit(const std::vector<std::array<double, 3>>& verts);
+
+    // Vertex positions the current grid was last built/refit from, kept so
+    // refitDirty() can diff against them and mark the OLD-position dirty band.
+    std::vector<std::array<double, 3>> _buildVerts;
+
+    // Dirty-voxel working state (persisted to avoid per-frame reallocation).
+    std::vector<std::uint8_t> _dirtyMask;   // grid-sized; 1 if voxel is in _dirtyList
+    std::vector<int>          _dirtyList;    // linear indices of dirty voxels
+    Eigen::Vector3i _dirtyMin = Eigen::Vector3i::Zero();  // dirty box (voxel coords, inclusive)
+    Eigen::Vector3i _dirtyMax = Eigen::Vector3i::Zero();
+    bool _dirtyValid      = false;           // did the last refitDirty mark anything?
+    bool _debugVerifyDirty = false;
 
     // CPU triangle list + BVH, kept alive after the build so closestTriangle()
     // can answer contact queries. Defined in the .cpp (holds .cpp-local types).
