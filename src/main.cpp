@@ -256,6 +256,23 @@ static GLuint  g_arrowVAO = 0, g_arrowVBO = 0;
 static GLsizei g_arrowVertCount = 0;             // number of arrow line vertices to draw
 static bool    g_drawArrows      = false;        // force-arrow overlay: OFF by default (presentation toggle)
 
+// Render layer: screen-space fluid (clear water) + solid shaded mesh, vs the raw
+// debug view of flat heatmap dots + wireframe. Toggleable live; ON by default.
+static bool    g_renderLayer     = true;
+
+// ---- Screen-space fluid rendering (SSFR) targets + tuning ----
+static int    g_ssfrW = 0, g_ssfrH = 0;          // current FBO size (recreated on resize)
+static GLuint g_sceneFBO = 0, g_sceneColorTex = 0, g_sceneDepthTex = 0;
+static GLuint g_fluidFBO = 0, g_fluidDistTex   = 0, g_fluidDepthRBO = 0;
+static GLuint g_blurFBO[2] = { 0, 0 }, g_blurTex[2] = { 0, 0 };
+static GLuint g_thickFBO = 0, g_thickTex = 0;
+
+static float  g_fluidRadius  = 0.10f;   // world-space particle sphere radius (~spacing, so spheres merge)
+static float  g_blurRadiusPx = 8.0f;    // surface-smoothing kernel half-width (px)
+static float  g_blurFalloff  = 0.15f;   // bilateral range (world units)
+static float  g_refractScale = 0.05f;   // background distortion strength
+static float  g_absorbScale  = 3.0f;    // Beer-Lambert depth-tint strength
+
 // ===================================================================
 // Two-way coupling — Step 3: anchors-first state machine + Laplacian deform
 // -------------------------------------------------------------------
@@ -1000,6 +1017,69 @@ static void respawnFluid(PBFluids& fluid, const FluidConfig& fc) {
 }
 
 // ===================================================================
+// Screen-space fluid rendering (SSFR) offscreen targets
+// ===================================================================
+static GLuint makeTex2D(int w, int h, GLint internalFmt, GLenum fmt, GLenum type, GLint filter) {
+    GLuint t; glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexImage2D(GL_TEXTURE_2D, 0, internalFmt, w, h, 0, fmt, type, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return t;
+}
+
+// (Re)create all SSFR render targets at the given size (called on first use and
+// whenever the window is resized).
+static void createSSFRTargets(int w, int h) {
+    if (g_sceneFBO) {
+        glDeleteFramebuffers(1, &g_sceneFBO);  glDeleteFramebuffers(1, &g_fluidFBO);
+        glDeleteFramebuffers(2, g_blurFBO);    glDeleteFramebuffers(1, &g_thickFBO);
+        glDeleteTextures(1, &g_sceneColorTex); glDeleteTextures(1, &g_sceneDepthTex);
+        glDeleteTextures(1, &g_fluidDistTex);  glDeleteTextures(2, g_blurTex);
+        glDeleteTextures(1, &g_thickTex);
+        glDeleteRenderbuffers(1, &g_fluidDepthRBO);
+    }
+
+    // Opaque scene: HDR colour + sampleable depth.
+    g_sceneColorTex = makeTex2D(w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, GL_LINEAR);
+    g_sceneDepthTex = makeTex2D(w, h, GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, GL_FLOAT, GL_NEAREST);
+    glGenFramebuffers(1, &g_sceneFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_sceneFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_sceneColorTex, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,  GL_TEXTURE_2D, g_sceneDepthTex, 0);
+
+    // Fluid eye-distance (R32F) + depth renderbuffer for sphere occlusion.
+    g_fluidDistTex = makeTex2D(w, h, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
+    glGenRenderbuffers(1, &g_fluidDepthRBO);
+    glBindRenderbuffer(GL_RENDERBUFFER, g_fluidDepthRBO);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+    glGenFramebuffers(1, &g_fluidFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fluidFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_fluidDistTex, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_fluidDepthRBO);
+
+    // Blur ping-pong (R32F).
+    for (int i = 0; i < 2; ++i) {
+        g_blurTex[i] = makeTex2D(w, h, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
+        glGenFramebuffers(1, &g_blurFBO[i]);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_blurFBO[i]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_blurTex[i], 0);
+    }
+
+    // Thickness (R16F).
+    g_thickTex = makeTex2D(w, h, GL_R16F, GL_RED, GL_FLOAT, GL_LINEAR);
+    glGenFramebuffers(1, &g_thickFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_thickFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_thickTex, 0);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    g_ssfrW = w; g_ssfrH = h;
+}
+
+// ===================================================================
 // MAIN
 // ===================================================================
 int main() {
@@ -1067,6 +1147,20 @@ int main() {
     GLuint meshProg = loadProgram(
         RESOURCES_PATH "shaders/graphics/VS_Mesh.glsl",
         RESOURCES_PATH "shaders/graphics/FS_Mesh.glsl");
+
+    // ------ Screen-space fluid (SSFR) programs -------------------
+    GLuint fluidDepthProg = loadProgram(
+        RESOURCES_PATH "shaders/graphics/VS_FluidPoint.glsl",
+        RESOURCES_PATH "shaders/graphics/FS_FluidDepth.glsl");
+    GLuint fluidThickProg = loadProgram(
+        RESOURCES_PATH "shaders/graphics/VS_FluidPoint.glsl",
+        RESOURCES_PATH "shaders/graphics/FS_FluidThickness.glsl");
+    GLuint depthBlurProg = loadProgram(
+        RESOURCES_PATH "shaders/graphics/VS_Fullscreen.glsl",
+        RESOURCES_PATH "shaders/graphics/FS_DepthBlur.glsl");
+    GLuint compositeProg = loadProgram(
+        RESOURCES_PATH "shaders/graphics/VS_Fullscreen.glsl",
+        RESOURCES_PATH "shaders/graphics/FS_FluidComposite.glsl");
 
     glGenVertexArrays(1, &g_meshVAO);
     glGenBuffers(1, &g_meshVBO);
@@ -1375,10 +1469,26 @@ int main() {
 
         // ===== Presentation ======================================
         ImGui::SeparatorText("Presentation");
+        // Render layer toggle — works in any state, including while Running.
+        if (ImGui::Button(g_renderLayer ? "Render Layer: ON" : "Render Layer: OFF",
+                          ImVec2(180, 0)))
+            g_renderLayer = !g_renderLayer;
+        ImGui::SameLine();
+        ImGui::TextDisabled(g_renderLayer ? "(water)" : "(debug)");
         ImGui::Checkbox("Show force arrows", &g_drawArrows);
         if (g_drawArrows)
             ImGui::SliderFloat("Arrow scale", &g_forceScale, 0.01f, 3.0f, "%.3f");
-        ImGui::SliderFloat("Point size", &pointSize, 1.0f, 40.0f);
+        if (!g_renderLayer)
+            ImGui::SliderFloat("Point size", &pointSize, 1.0f, 40.0f);
+
+        // Screen-space fluid (water) tuning — only meaningful with the render layer on.
+        if (g_renderLayer && ImGui::CollapsingHeader("Water look (SSFR)")) {
+            ImGui::SliderFloat("Particle radius", &g_fluidRadius, 0.02f, 0.20f, "%.3f");
+            ImGui::SliderFloat("Surface smoothing", &g_blurRadiusPx, 1.0f, 24.0f, "%.0f");
+            ImGui::SliderFloat("Edge preserve", &g_blurFalloff, 0.02f, 0.50f, "%.3f");
+            ImGui::SliderFloat("Refraction", &g_refractScale, 0.0f, 0.20f, "%.3f");
+            ImGui::SliderFloat("Depth tint", &g_absorbScale, 0.0f, 20.0f, "%.1f");
+        }
 
         // ===== Mesh & boundary (collapsed) =======================
         if (ImGui::CollapsingHeader("Mesh & Boundary")) {
@@ -1579,7 +1689,9 @@ int main() {
         }
 
         // ---- Clear -----------------------------------------------
-        glClearColor(0.2f, 0.2f, 0.2f, 1.0f);
+        // Neutral grey backdrop in render-layer mode; darker grey for debug.
+        if (g_renderLayer) glClearColor(0.50f, 0.51f, 0.53f, 1.0f);
+        else               glClearColor(0.20f, 0.20f, 0.20f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glEnable(GL_DEPTH_TEST);
 
@@ -1588,49 +1700,162 @@ int main() {
         glm::mat4 P = glm::perspective(glm::radians(45.f), aspect, 0.01f, 100.f);
         glm::mat4 VP = P * V;
 
-        // ---- Draw particles (instanced from SSBO) ---------------
-        glEnable(GL_PROGRAM_POINT_SIZE);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        const bool waterMode = g_renderLayer && fluid.params().particleCount > 0;
 
-        glUseProgram(particleProg);
-        glUniformMatrix4fv(glGetUniformLocation(particleProg, "view"), 1, GL_FALSE, glm::value_ptr(V));
-        glUniformMatrix4fv(glGetUniformLocation(particleProg, "projection"), 1, GL_FALSE, glm::value_ptr(P));
-        glUniformMatrix4fv(glGetUniformLocation(particleProg, "model"), 1, GL_FALSE, glm::value_ptr(glm::mat4(1.f)));
-        glUniform1f(glGetUniformLocation(particleProg, "scale"), pointSize);
+        if (waterMode) {
+            // =========================================================
+            // Screen-space fluid: depth -> blur -> thickness -> composite
+            // =========================================================
+            if (g_ssfrW != g_winW || g_ssfrH != g_winH) createSSFRTargets(g_winW, g_winH);
+            const float nearP = 0.01f, farP = 100.0f;
+            const U32   pcount = fluid.params().particleCount;
 
-        fluid.bindParticlesForRendering();   // SSBO 0 stays on GPU
+            // PASS 1 — opaque scene (shaded mesh) into the scene FBO. This grey is
+            // the backdrop the water sits against and refracts.
+            glBindFramebuffer(GL_FRAMEBUFFER, g_sceneFBO);
+            glViewport(0, 0, g_winW, g_winH);
+            glClearColor(0.50f, 0.51f, 0.53f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glEnable(GL_DEPTH_TEST);
+            if (g_sdfEnabled && g_meshIdxCount > 0) {
+                glUseProgram(meshProg);
+                glUniformMatrix4fv(glGetUniformLocation(meshProg, "VP"), 1, GL_FALSE, glm::value_ptr(VP));
+                glUniform1i(glGetUniformLocation(meshProg, "renderMode"), 1);
+                if (g_sdfContainer) { glEnable(GL_CULL_FACE); glCullFace(GL_FRONT); }
+                glBindVertexArray(g_meshVAO);
+                glDrawElements(GL_TRIANGLES, g_meshIdxCount, GL_UNSIGNED_INT, nullptr);
+                glBindVertexArray(0);
+                if (g_sdfContainer) glDisable(GL_CULL_FACE);
+            }
 
-        glBindVertexArray(emptyVAO);
-        // Use the live particle count (0 during Setup, may differ from the config
-        // when a grid spawn under-fills) so we never read past the SSBO.
-        glDrawArraysInstanced(GL_POINTS, 0, 1, fluid.params().particleCount);
-        glBindVertexArray(0);
-
-        glDisable(GL_PROGRAM_POINT_SIZE);
-        glDisable(GL_BLEND);
-
-        // ---- Draw boundary box ----------------------------------
-        glUseProgram(lineProg);
-        glUniformMatrix4fv(glGetUniformLocation(lineProg, "VP"), 1, GL_FALSE, glm::value_ptr(VP));
-        glUniform3f(glGetUniformLocation(lineProg, "color"), 0.35f, 0.55f, 0.85f);
-
-        glBindVertexArray(boxVAO);
-        glDrawArrays(GL_LINES, 0, 24);
-        glBindVertexArray(0);
-
-        // ---- Draw SDF boundary mesh (wireframe, per-vertex colour) --
-        if (g_sdfEnabled && g_meshIdxCount > 0) {
-            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-            glUseProgram(meshProg);
-            glUniformMatrix4fv(glGetUniformLocation(meshProg, "VP"), 1, GL_FALSE, glm::value_ptr(VP));
-            glBindVertexArray(g_meshVAO);
-            glDrawElements(GL_TRIANGLES, g_meshIdxCount, GL_UNSIGNED_INT, nullptr);
+            // PASS 2 — fluid eye-distance (sphere imposters, depth-tested).
+            glBindFramebuffer(GL_FRAMEBUFFER, g_fluidFBO);
+            glViewport(0, 0, g_winW, g_winH);
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);          // 0 = no fluid
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glEnable(GL_DEPTH_TEST); glDepthMask(GL_TRUE); glDisable(GL_BLEND);
+            glEnable(GL_PROGRAM_POINT_SIZE);
+            glUseProgram(fluidDepthProg);
+            glUniformMatrix4fv(glGetUniformLocation(fluidDepthProg, "view"), 1, GL_FALSE, glm::value_ptr(V));
+            glUniformMatrix4fv(glGetUniformLocation(fluidDepthProg, "projection"), 1, GL_FALSE, glm::value_ptr(P));
+            glUniform1f(glGetUniformLocation(fluidDepthProg, "pointRadius"), g_fluidRadius);
+            glUniform1f(glGetUniformLocation(fluidDepthProg, "screenHeight"), (float)g_winH);
+            fluid.bindParticlesForRendering();
+            glBindVertexArray(emptyVAO);
+            glDrawArraysInstanced(GL_POINTS, 0, 1, pcount);
             glBindVertexArray(0);
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            glDisable(GL_PROGRAM_POINT_SIZE);
+
+            // PASS 3 — separable bilateral blur (H: dist->blur0, V: blur0->blur1).
+            glDisable(GL_DEPTH_TEST);
+            glUseProgram(depthBlurProg);
+            glUniform1i(glGetUniformLocation(depthBlurProg, "depthTex"), 0);
+            glUniform1f(glGetUniformLocation(depthBlurProg, "blurRadiusPx"), g_blurRadiusPx);
+            glUniform1f(glGetUniformLocation(depthBlurProg, "depthFalloff"), g_blurFalloff);
+            glActiveTexture(GL_TEXTURE0);
+            glBindFramebuffer(GL_FRAMEBUFFER, g_blurFBO[0]);
+            glBindTexture(GL_TEXTURE_2D, g_fluidDistTex);
+            glUniform2f(glGetUniformLocation(depthBlurProg, "texelDir"), 1.0f / g_winW, 0.0f);
+            glBindVertexArray(emptyVAO); glDrawArrays(GL_TRIANGLES, 0, 3);
+            glBindFramebuffer(GL_FRAMEBUFFER, g_blurFBO[1]);
+            glBindTexture(GL_TEXTURE_2D, g_blurTex[0]);
+            glUniform2f(glGetUniformLocation(depthBlurProg, "texelDir"), 0.0f, 1.0f / g_winH);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glBindVertexArray(0);
+
+            // PASS 4 — thickness (additive, no depth).
+            glBindFramebuffer(GL_FRAMEBUFFER, g_thickFBO);
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
+            glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE);
+            glEnable(GL_PROGRAM_POINT_SIZE);
+            glUseProgram(fluidThickProg);
+            glUniformMatrix4fv(glGetUniformLocation(fluidThickProg, "view"), 1, GL_FALSE, glm::value_ptr(V));
+            glUniformMatrix4fv(glGetUniformLocation(fluidThickProg, "projection"), 1, GL_FALSE, glm::value_ptr(P));
+            glUniform1f(glGetUniformLocation(fluidThickProg, "pointRadius"), g_fluidRadius);
+            glUniform1f(glGetUniformLocation(fluidThickProg, "screenHeight"), (float)g_winH);
+            fluid.bindParticlesForRendering();
+            glBindVertexArray(emptyVAO);
+            glDrawArraysInstanced(GL_POINTS, 0, 1, pcount);
+            glBindVertexArray(0);
+            glDisable(GL_PROGRAM_POINT_SIZE);
+            glDisable(GL_BLEND); glDepthMask(GL_TRUE);
+
+            // PASS 5 — composite to the screen.
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, g_winW, g_winH);
+            glDisable(GL_DEPTH_TEST);
+            glUseProgram(compositeProg);
+            glUniform1i(glGetUniformLocation(compositeProg, "smoothedDepth"), 0);
+            glUniform1i(glGetUniformLocation(compositeProg, "thicknessTex"), 1);
+            glUniform1i(glGetUniformLocation(compositeProg, "sceneColor"), 2);
+            glUniform1i(glGetUniformLocation(compositeProg, "sceneDepthTex"), 3);
+            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_blurTex[1]);
+            glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, g_thickTex);
+            glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, g_sceneColorTex);
+            glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, g_sceneDepthTex);
+            glUniform2f(glGetUniformLocation(compositeProg, "invScreen"), 1.0f / g_winW, 1.0f / g_winH);
+            glUniform1f(glGetUniformLocation(compositeProg, "fx"), P[0][0]);
+            glUniform1f(glGetUniformLocation(compositeProg, "fy"), P[1][1]);
+            glUniform1f(glGetUniformLocation(compositeProg, "nearP"), nearP);
+            glUniform1f(glGetUniformLocation(compositeProg, "farP"), farP);
+            glUniform3f(glGetUniformLocation(compositeProg, "absorb"),
+                        0.35f * g_absorbScale, 0.18f * g_absorbScale, 0.08f * g_absorbScale);
+            glUniform1f(glGetUniformLocation(compositeProg, "refractScale"), g_refractScale);
+            glUniform3f(glGetUniformLocation(compositeProg, "waterTint"), 0.04f, 0.20f, 0.32f);
+            glBindVertexArray(emptyVAO); glDrawArrays(GL_TRIANGLES, 0, 3); glBindVertexArray(0);
+            glActiveTexture(GL_TEXTURE0);
+            glEnable(GL_DEPTH_TEST);
+        }
+        else {
+            // =========================================================
+            // Debug view: heatmap dots (or shaded spheres if the render
+            // layer is on but no fluid yet), boundary box, wireframe/solid mesh.
+            // =========================================================
+            glEnable(GL_PROGRAM_POINT_SIZE);
+            if (!g_renderLayer) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); }
+
+            glUseProgram(particleProg);
+            glUniformMatrix4fv(glGetUniformLocation(particleProg, "view"), 1, GL_FALSE, glm::value_ptr(V));
+            glUniformMatrix4fv(glGetUniformLocation(particleProg, "projection"), 1, GL_FALSE, glm::value_ptr(P));
+            glUniformMatrix4fv(glGetUniformLocation(particleProg, "model"), 1, GL_FALSE, glm::value_ptr(glm::mat4(1.f)));
+            glUniform1f(glGetUniformLocation(particleProg, "scale"), pointSize);
+            glUniform1i(glGetUniformLocation(particleProg, "renderMode"), g_renderLayer ? 1 : 0);
+
+            fluid.bindParticlesForRendering();
+            glBindVertexArray(emptyVAO);
+            glDrawArraysInstanced(GL_POINTS, 0, 1, fluid.params().particleCount);
+            glBindVertexArray(0);
+
+            glDisable(GL_PROGRAM_POINT_SIZE);
+            if (!g_renderLayer) glDisable(GL_BLEND);
+
+            if (!g_renderLayer) {
+                glUseProgram(lineProg);
+                glUniformMatrix4fv(glGetUniformLocation(lineProg, "VP"), 1, GL_FALSE, glm::value_ptr(VP));
+                glUniform3f(glGetUniformLocation(lineProg, "color"), 0.35f, 0.55f, 0.85f);
+                glBindVertexArray(boxVAO);
+                glDrawArrays(GL_LINES, 0, 24);
+                glBindVertexArray(0);
+            }
+
+            if (g_sdfEnabled && g_meshIdxCount > 0) {
+                glUseProgram(meshProg);
+                glUniformMatrix4fv(glGetUniformLocation(meshProg, "VP"), 1, GL_FALSE, glm::value_ptr(VP));
+                glUniform1i(glGetUniformLocation(meshProg, "renderMode"), g_renderLayer ? 1 : 0);
+                const bool cullForContainer = g_renderLayer && g_sdfContainer;
+                if (cullForContainer) { glEnable(GL_CULL_FACE); glCullFace(GL_FRONT); }
+                if (!g_renderLayer)   glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+                glBindVertexArray(g_meshVAO);
+                glDrawElements(GL_TRIANGLES, g_meshIdxCount, GL_UNSIGNED_INT, nullptr);
+                glBindVertexArray(0);
+                if (!g_renderLayer)   glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                if (cullForContainer) glDisable(GL_CULL_FACE);
+            }
         }
 
-        // ---- Draw contact-force arrows (Step 2 checkpoint) ------
+        // ---- Draw contact-force arrows (overlay, both modes) ----
         if (g_arrowVertCount > 0) {
             glUseProgram(lineProg);
             glUniformMatrix4fv(glGetUniformLocation(lineProg, "VP"), 1, GL_FALSE, glm::value_ptr(VP));
@@ -1665,6 +1890,19 @@ int main() {
     glDeleteProgram(particleProg);
     glDeleteProgram(lineProg);
     glDeleteProgram(meshProg);
+    glDeleteProgram(fluidDepthProg);
+    glDeleteProgram(fluidThickProg);
+    glDeleteProgram(depthBlurProg);
+    glDeleteProgram(compositeProg);
+
+    if (g_sceneFBO) {
+        glDeleteFramebuffers(1, &g_sceneFBO);  glDeleteFramebuffers(1, &g_fluidFBO);
+        glDeleteFramebuffers(2, g_blurFBO);    glDeleteFramebuffers(1, &g_thickFBO);
+        glDeleteTextures(1, &g_sceneColorTex); glDeleteTextures(1, &g_sceneDepthTex);
+        glDeleteTextures(1, &g_fluidDistTex);  glDeleteTextures(2, g_blurTex);
+        glDeleteTextures(1, &g_thickTex);
+        glDeleteRenderbuffers(1, &g_fluidDepthRBO);
+    }
 
     glfwDestroyWindow(window);
     glfwTerminate();
