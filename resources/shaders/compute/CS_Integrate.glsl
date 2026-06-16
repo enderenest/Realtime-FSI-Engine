@@ -145,6 +145,7 @@ void main() {
     // XSPH VISCOSITY + CURL (piggybacked neighbor loop)
     // =========================================================================
     vec3 vel = oldVel;
+    vec3 viscosityDelta = vec3(0.0);   // XSPH smoothing; applied to the FINAL velocity below
 
     bool doViscosity = (ubo.enableViscosity == 1u);
     bool doVorticity = (enableVorticity == 1u);
@@ -185,7 +186,10 @@ void main() {
             }
         }
 
-        if (doViscosity) vel += viscosityForce * ubo.viscosity;
+        // Store, don't apply yet: the velocity is re-derived from positions below
+        // (line "vel = (predPos - oldPos) * invDt"), which would overwrite anything
+        // added here. XSPH must be applied AFTER that derivation to actually damp.
+        if (doViscosity) viscosityDelta = viscosityForce * ubo.viscosity;
         if (doVorticity) solver[id].deltaP_rho.xyz = curl * ubo.invRho0;
     }
 
@@ -241,6 +245,12 @@ void main() {
 
     vel = (predPos - oldPos) * invDt;
 
+    // XSPH viscosity: now that the position-derived velocity exists, blend toward the
+    // neighborhood-average velocity. This is the fluid's main energy-dissipation path;
+    // applying it here (instead of before the line above, where it was overwritten and
+    // silently discarded) is what lets relative motion decay and the fluid settle.
+    vel += viscosityDelta;
+
     // Clamp velocity magnitude
     float speedSq = dot(vel, vel);
     if (speedSq > 2500.0) vel *= (50.0 / sqrt(speedSq));
@@ -250,11 +260,14 @@ void main() {
     if (collidedY) vel.y *= -ubo.boundDamping;
     if (collidedZ) vel.z *= -ubo.boundDamping;
 
-    // SDF response: reflect the inward (normal) component of velocity with
-    // restitution = boundDamping, leaving the tangential flow along the surface.
+    // SDF response: remove the ENTIRE normal component of velocity at the wall, keeping
+    // only tangential flow. Fully inelastic (no restitution → no energy injection), and
+    // by zeroing both signs it also cancels the inward "launch" velocity that the
+    // position projection above otherwise imparts — the residual oscillation source.
+    // Tangential motion is untouched, so the fluid still slides/spreads (no sticking).
     if (collidedSDF) {
         float vn = dot(vel, sdfNormal);
-        if (vn < 0.0) vel -= (1.0 + ubo.boundDamping) * vn * sdfNormal;
+        vel -= vn * sdfNormal;
     }
 
     // =========================================================================

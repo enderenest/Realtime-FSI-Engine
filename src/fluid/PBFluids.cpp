@@ -425,7 +425,32 @@ void PBFluids::step()
             _csComputeLOD.wait();
         }
 
-        // 4b. Constraint Solving
+        // 4b. SDF boundary setup for the solver. Bind the texture once and give the
+        // grid metadata to ApplyDeltaP, which projects predicted positions back onto
+        // the boundary each iteration so the density solve stays boundary-consistent.
+        // Done once per substep; the texture-unit binding persists across the loop.
+        if (_sdf && _sdf->valid()) {
+            _sdf->bindForQuery(kSDFTextureUnit);
+            const Eigen::Vector3d& o   = _sdf->origin();
+            const Eigen::Vector3i& dim = _sdf->dimensions();
+            const F32 ox = (F32)o.x(), oy = (F32)o.y(), oz = (F32)o.z();
+            const F32 cs = (F32)_sdf->cellSize();
+            const F32 rx = (F32)dim.x(), ry = (F32)dim.y(), rz = (F32)dim.z();
+            const U32 mode = _sdfContainment ? 1u : 0u;
+
+            _csApplyDeltaP.use();
+            _csApplyDeltaP.setUint ("enableSDF",     1u);
+            _csApplyDeltaP.setUint ("sdfMode",       mode);
+            _csApplyDeltaP.setVec4 ("sdfOrigin",     ox, oy, oz, 0.0f);
+            _csApplyDeltaP.setFloat("sdfCellSize",   cs);
+            _csApplyDeltaP.setVec4 ("sdfResolution", rx, ry, rz, 0.0f);
+            _csApplyDeltaP.setFloat("sdfPadding",    _sdfPadding);
+        } else {
+            _csApplyDeltaP.use();
+            _csApplyDeltaP.setUint("enableSDF", 0u);
+        }
+
+        // 4c. Constraint Solving
         // iter is 1-based: particle is active if lod[id] >= iter (eq. 9 in APBF paper)
         const U32 maxIter = _params.enableAPBF ? _params.maxLOD : _params.solverIterations;
         for (U32 iter = 1; iter <= maxIter; ++iter) {
