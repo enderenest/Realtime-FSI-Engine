@@ -223,7 +223,6 @@ static std::vector<PVec3>  g_vertForces;         // accumulated push force, per 
 static std::vector<ContactCandidate> g_candidateList; // GPU-filtered near-surface particles
 static std::vector<float>  g_arrowVerts;         // scratch: arrow line-segment vertices (xyz)
 
-static bool   g_couplingEnabled  = false;        // master toggle for contact detection
 static float  g_contactRadius    = 0.12f;        // surface band counted as contact (world units)
 static bool   g_useVelMagnitude  = true;         // force magnitude = velocity-into-surface vs constant
 static float  g_forceScale       = 0.50f;        // arrow length per unit force (visualization only)
@@ -233,6 +232,7 @@ static int    g_controlCount     = 0;            // vertices above the control-p
 
 static GLuint  g_arrowVAO = 0, g_arrowVBO = 0;
 static GLsizei g_arrowVertCount = 0;             // number of arrow line vertices to draw
+static bool    g_drawArrows      = false;        // force-arrow overlay: OFF by default (presentation toggle)
 
 // ===================================================================
 // Two-way coupling — Step 3: anchors-first state machine + Laplacian deform
@@ -638,19 +638,22 @@ static void computeContactForces(PBFluids& fluid) {
     }
     g_contactCount = contactCount;
 
-    // Build the arrow line buffer and count control points (threshold crossings).
+    // Count control points (threshold crossings) always — they drive deformation.
+    // Build the arrow line geometry only when the overlay is enabled, so the
+    // visualization is a pure presentation cost that is off by default.
     g_arrowVerts.clear();
     for (size_t i = 0; i < g_vertForces.size(); ++i) {
         const PVec3 F = g_vertForces[i];
         const float m = norm(F);
         if (m < 1e-5f) continue;
         if (m >= g_controlThreshold) ++g_controlCount;
+        if (!g_drawArrows) continue;
         const PVec3 base{ (float)g_meshData.verts[i][0],
                           (float)g_meshData.verts[i][1],
                           (float)g_meshData.verts[i][2] };
         pushArrow(g_arrowVerts, base, F * g_forceScale);
     }
-    g_arrowVertCount = (GLsizei)(g_arrowVerts.size() / 3);
+    g_arrowVertCount = g_drawArrows ? (GLsizei)(g_arrowVerts.size() / 3) : 0;
 
     if (g_arrowVertCount > 0) {
         glBindBuffer(GL_ARRAY_BUFFER, g_arrowVBO);
@@ -897,26 +900,31 @@ static void confirmAnchorsAndSpawn(PBFluids& fluid, const FluidConfig& fc) {
     g_dstate = DeformState::Ready;
 }
 
-// HARD RESET: return both the solid and the fluid to their initial state.
-// Drops all deformation state, reloads the boundary mesh to its rest shape
-// (which rebuilds the SDF + BVH + wireframe), and respawns the fluid.
-static void hardReset(PBFluids& fluid, const FluidConfig& fc) {
-    g_dstate = DeformState::Inactive;
-    g_deformer.reset();
-    g_anchors.clear();
-    g_lastHandleSet.clear();
-    g_restPositions.clear();
+// Load a mesh from disk and drop straight into the anchor-picking Setup state
+// (no particles). Used at startup and whenever the user swaps the mesh. The mesh
+// is fitted/SDF-built by loadMeshBoundary using the current g_sdf* globals, so
+// set those before calling.
+static void loadMeshAndSetup(const std::string& path, PBFluids& fluid) {
+    loadMeshBoundary(path, fluid);   // fit mesh, build SDF + wireframe, fill g_meshData
+    enterSetup(fluid);               // clear particles, build deform mesh, clear anchors
+}
 
+// RESET: return to the start of the workflow. Reloads the current mesh from its
+// source file (undoing any deformation) and re-enters Setup with no particles,
+// so the demo can be run again from a clean state.
+static void resetToSetup(PBFluids& fluid) {
     g_arrowVertCount = 0;
-    g_handleCount = 0;
-
-    // Reload the boundary mesh from its source so deformation is undone.
+    g_handleCount    = 0;
     if (g_selFile >= 0 && g_selFile < (int)g_offFiles.size())
-        loadMeshBoundary(g_offFiles[g_selFile], fluid);
-    else if (g_sdfContainer)
-        loadContainerBox(fluid);
+        loadMeshAndSetup(g_offFiles[g_selFile], fluid);
+    else
+        enterSetup(fluid);           // fallback: rebuild from current data
+}
 
-    // Respawn the fluid at its initial configuration.
+// RESPAWN: re-create the fluid at its initial spawn block. Only the fluid is
+// reset — the mesh, anchors, and current play/pause state are left untouched, so
+// a fresh block of fluid drops onto the same (possibly deformed) shell.
+static void respawnFluid(PBFluids& fluid, const FluidConfig& fc) {
     fluid.setParticles(spawnParticles(fc));
 }
 
@@ -949,12 +957,13 @@ int main() {
     ImGui::GetStyle().WindowRounding = 4.0f;
 
     // ------ Simulation -------------------------------------------
-    Config cfg{};
     const auto& scenes = getScenes();
     int currentScene = 0;
+    Config cfg{};
+    cfg.fluid = scenes[currentScene].fluid;   // initial solver params (scene fully applied below)
     PBFluids fluid(cfg.fluid);
-    fluid.setParticles(spawnParticles(cfg.fluid));
     fluid.setCollisionPadding(0.0f);
+    // No particles yet: they are spawned (frozen) only after anchors are confirmed.
 
     // ------ Particle shader (reads SSBO binding 0) ---------------
     GLuint particleProg = loadProgram(
@@ -1004,20 +1013,53 @@ int main() {
     glBindVertexArray(0);
 
 
-    // Center camera on bounds
-    g_camTarget = glm::vec3(
-        (cfg.fluid.boundsMin.x + cfg.fluid.boundsMax.x) * 0.5f,
-        (cfg.fluid.boundsMin.y + cfg.fluid.boundsMax.y) * 0.5f,
-        (cfg.fluid.boundsMin.z + cfg.fluid.boundsMax.z) * 0.5f);
-
     // ------ State ------------------------------------------------
-    bool  paused = false;
-    bool  stepOnce = false;
-    bool  respawn = false;
-    float pointSize = 8.0f;
+    float pointSize = scenes[currentScene].pointSize;
     bool  rightDown = false;
     bool  midDown = false;
     double lastRX = 0, lastRY = 0, lastMX = 0, lastMY = 0;
+
+    // loadScene: apply a scene's fluid params, camera framing, and mesh/SDF
+    // settings, then drop into the anchor-picking Setup state (no particles).
+    // Used at startup and by the Scene selector in the panel. The mesh GL buffers
+    // and the asset list (scanOffAssets) are ready by this point.
+    auto loadScene = [&](int idx) {
+        if (idx < 0 || idx >= (int)scenes.size()) return;
+        currentScene = idx;
+        const Scene& sc = scenes[idx];
+
+        cfg.fluid = sc.fluid;
+        fluid.setParams(cfg.fluid);
+        fluid.setBounds(cfg.fluid.boundsMin, cfg.fluid.boundsMax, cfg.fluid.boundDamping);
+
+        g_sdfMeshSize  = sc.meshFitSize;
+        g_sdfCell      = sc.sdfCell;
+        g_sdfPadding   = sc.sdfPadding;
+        g_sdfContainer = sc.sdfContainer;
+
+        pointSize  = sc.pointSize;
+        g_camYaw   = sc.camYaw;
+        g_camPitch = sc.camPitch;
+        g_camDist  = sc.camDist;
+        g_camTarget = glm::vec3(
+            (cfg.fluid.boundsMin.x + cfg.fluid.boundsMax.x) * 0.5f,
+            (cfg.fluid.boundsMin.y + cfg.fluid.boundsMax.y) * 0.5f,
+            (cfg.fluid.boundsMin.z + cfg.fluid.boundsMax.z) * 0.5f);
+
+        fillBoxVerts(boxData, cfg.fluid.boundsMin, cfg.fluid.boundsMax);
+        glBindBuffer(GL_ARRAY_BUFFER, boxVBO);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(boxData), boxData);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+        // Load the scene's mesh (selecting it in the asset list) and enter Setup.
+        int fileIdx = -1;
+        for (int i = 0; i < (int)g_offFiles.size(); ++i)
+            if (g_offFiles[i].find(sc.meshFile) != std::string::npos) { fileIdx = i; break; }
+        if (fileIdx >= 0) { g_selFile = fileIdx; loadMeshAndSetup(g_offFiles[fileIdx], fluid); }
+        else loadMeshAndSetup(std::string(RESOURCES_PATH) + "assets/" + sc.meshFile, fluid);
+    };
+
+    loadScene(currentScene);            // boot into the first scene
 
     // FPS counter
     double fpsTime = glfwGetTime();
@@ -1130,274 +1172,229 @@ int main() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-        ImGui::Text("FPS: %d  |  Particles: %u", fps, fluid.params().particleCount);
-        ImGui::Separator();
+        ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Fluid-Mesh Interaction", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
-        // Scene selector
-        if (ImGui::Combo("Scene", &currentScene,
-            [](void* data, int idx, const char** out) -> bool {
-                auto* s = (const std::vector<Scene>*)data;
-                if (idx < 0 || idx >= (int)s->size()) return false;
-                *out = (*s)[idx].name;
-                return true;
-            },
-            (void*)&scenes, (int)scenes.size()))
-        {
-            const Scene& sc = scenes[currentScene];
-            cfg.fluid = sc.fluid;
-            pointSize = sc.pointSize;
-            g_camYaw = sc.camYaw;
-            g_camPitch = sc.camPitch;
-            g_camDist = sc.camDist;
-            g_camTarget = glm::vec3(
-                (sc.fluid.boundsMin.x + sc.fluid.boundsMax.x) * 0.5f,
-                (sc.fluid.boundsMin.y + sc.fluid.boundsMax.y) * 0.5f,
-                (sc.fluid.boundsMin.z + sc.fluid.boundsMax.z) * 0.5f);
+        // Dirty flags collected from the Advanced controls below; applied once
+        // after the panel so a change costs a single UBO/bounds re-upload.
+        bool solverDirty = false, scorrDirty = false, boundsDirty = false, spawnDirty = false;
 
-            fluid.setParams(cfg.fluid);
-            fluid.setBounds(cfg.fluid.boundsMin, cfg.fluid.boundsMax, cfg.fluid.boundDamping);
+        // ===== Status header =====================================
+        ImGui::Text("FPS %d", fps);
+        ImGui::SameLine(0.0f, 24.0f);
+        ImGui::Text("Particles %u", fluid.params().particleCount);
 
-            fillBoxVerts(boxData, cfg.fluid.boundsMin, cfg.fluid.boundsMax);
-            glBindBuffer(GL_ARRAY_BUFFER, boxVBO);
-            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(boxData), boxData);
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
+        const char* stateName =
+            g_dstate == DeformState::Setup   ? "SETUP - pick anchor points"        :
+            g_dstate == DeformState::Ready   ? "READY - fluid frozen, press Start" :
+            g_dstate == DeformState::Running ? "RUNNING"                           :
+            g_dstate == DeformState::Paused  ? "PAUSED"                            : "INACTIVE";
+        const ImVec4 stateCol =
+            g_dstate == DeformState::Setup   ? ImVec4(0.96f, 0.76f, 0.26f, 1.0f) :
+            g_dstate == DeformState::Ready   ? ImVec4(0.40f, 0.72f, 1.00f, 1.0f) :
+            g_dstate == DeformState::Running ? ImVec4(0.36f, 0.86f, 0.42f, 1.0f) :
+                                               ImVec4(0.82f, 0.82f, 0.82f, 1.0f);
+        ImGui::TextColored(stateCol, "%s", stateName);
+        ImGui::Text("Anchors %d    Handles %d", (int)g_anchors.size(), g_handleCount);
 
-            fluid.setParticles(spawnParticles(cfg.fluid));
-
-            // Switching scenes invalidates any in-progress deformation session.
-            g_dstate = DeformState::Inactive;
-            g_deformer.reset();
-            g_anchors.clear();
-            g_lastHandleSet.clear();
-            g_restPositions.clear();
-        
-            g_arrowVertCount = 0;
-
-            // Scene-specific SDF setup: the container scene drops in a box that
-            // holds the fluid; every other scene starts with the SDF cleared.
-            if (std::string(sc.name) == "SDF Container (Leak Test)") {
-                loadContainerBox(fluid);
-            } else {
-                g_sdfEnabled = false;
-                g_sdfContainer = false;
-                fluid.setSDFBoundary(nullptr);
+        // ===== Scene selector ====================================
+        // A dropdown over the curated scenes. Selecting one loads its mesh and
+        // restarts the anchor-picking workflow.
+        ImGui::SeparatorText("Scene");
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::BeginCombo("##scene", scenes[currentScene].name)) {
+            for (int i = 0; i < (int)scenes.size(); ++i) {
+                bool sel = (currentScene == i);
+                if (ImGui::Selectable(scenes[i].name, sel) && i != currentScene)
+                    loadScene(i);
+                if (sel) ImGui::SetItemDefaultFocus();
             }
+            ImGui::EndCombo();
         }
-        ImGui::Separator();
 
-        if (ImGui::Checkbox("Paused", &paused)) {}
-        ImGui::SameLine();
-        if (ImGui::Button("Step"))    stepOnce = true;
-        ImGui::SameLine();
-        if (ImGui::Button("Respawn")) respawn = true;
+        // ===== Workflow ==========================================
+        ImGui::SeparatorText("Workflow");
 
-        ImGui::Separator(); ImGui::Text("Rendering");
-        ImGui::SliderFloat("Point Size (px)", &pointSize, 1.0f, 40.0f);
+        if (g_dstate == DeformState::Setup) {
+            ImGui::TextWrapped("Left-click vertices on the mesh to place anchor points "
+                               "(shown red). Anchors pin the shell so the fluid dents it "
+                               "in place instead of pushing it around.");
 
-        ImGui::Separator(); ImGui::Text("Time & Forces");
-        bool solverDirty = false;
-        solverDirty |= ImGui::SliderFloat("dt", &cfg.fluid.dt, 1.f / 240.f, 1.f / 30.f);
-        solverDirty |= ImGui::SliderFloat3("gravity", &cfg.fluid.gravity.x, -10.f, 10.f);
-
-        ImGui::Separator(); ImGui::Text("PBF Params");
-        solverDirty |= ImGui::SliderFloat("h", &cfg.fluid.h, 0.01f, 0.30f);
-        solverDirty |= ImGui::SliderFloat("rho0", &cfg.fluid.rho0, 100.f, 3000.f);
-        {
-            int v = (int)cfg.fluid.solverIterations;
-            if (ImGui::SliderInt("solver iters", &v, 1, 12)) { cfg.fluid.solverIterations = (U32)v; solverDirty = true; }
-        }
-        {
-            int v = (int)cfg.fluid.substepIterations;
-            if (ImGui::SliderInt("substeps", &v, 1, 5)) { cfg.fluid.substepIterations = (U32)v; solverDirty = true; }
-        }
-        solverDirty |= ImGui::SliderFloat("eps", &cfg.fluid.eps, 1e-8f, 1e-3f, "%.8f", ImGuiSliderFlags_Logarithmic);
-
-        ImGui::Separator(); ImGui::Text("Spawn");
-        bool spawnDirty = false;
-        spawnDirty |= ImGui::Checkbox("spawnRandom", &cfg.fluid.spawnRandom);
-        spawnDirty |= ImGui::SliderFloat("spacing", &cfg.fluid.spacing, 0.005f, 0.15f);
-        spawnDirty |= ImGui::SliderFloat3("spawnMin", &cfg.fluid.spawnMin.x, -10.f, 10.f);
-        spawnDirty |= ImGui::SliderFloat3("spawnMax", &cfg.fluid.spawnMax.x, -10.f, 10.f);
-        spawnDirty |= ImGui::SliderFloat3("initialVel", &cfg.fluid.initialVelocity.x, -5.f, 5.f);
-
-        ImGui::Separator(); ImGui::Text("Bounds (AABB)");
-        bool boundsDirty = false;
-        boundsDirty |= ImGui::SliderFloat3("boundsMin", &cfg.fluid.boundsMin.x, -20.0f, 20.f);
-        boundsDirty |= ImGui::SliderFloat3("boundsMax", &cfg.fluid.boundsMax.x, -20.0f, 20.f);
-        boundsDirty |= ImGui::SliderFloat("boundDamping", &cfg.fluid.boundDamping, 0.f, 1.f);
-
-        ImGui::Separator(); ImGui::Text("SDF Boundary");
-        if (ImGui::Checkbox("enableSDF", &g_sdfEnabled))
-            fluid.setSDFBoundary(g_sdfEnabled && g_sdf.valid() ? &g_sdf : nullptr);
-        if (ImGui::Checkbox("container (keep fluid inside)", &g_sdfContainer))
-            fluid.setSDFContainment(g_sdfContainer);
-        if (ImGui::Button("Load Container Box")) loadContainerBox(fluid);
-        if (ImGui::SliderFloat("sdfPadding", &g_sdfPadding, 0.0f, 0.2f, "%.3f"))
-            fluid.setSDFPadding(g_sdfPadding);
-        ImGui::SliderFloat("sdfMeshSize", &g_sdfMeshSize, 0.5f, 20.0f);
-        ImGui::SliderFloat("sdfCell", &g_sdfCell, 0.04f, 0.25f, "%.3f");
-        ImGui::SliderInt("sdfUpdateEvery (collision refresh)", &g_sdfUpdateEvery, 1, 8);
-        {
+            // Mesh choice — only meaningful before the fluid is spawned. Selecting
+            // a mesh swaps it in and restarts the anchor-picking workflow.
             const char* preview = (g_selFile >= 0 && g_selFile < (int)g_offFiles.size())
-                ? g_offFiles[g_selFile].c_str() : "Load .off mesh...";
-            if (ImGui::BeginCombo("mesh", preview)) {
+                ? g_offFiles[g_selFile].c_str() : "Choose a mesh...";
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##mesh", preview)) {
                 for (int i = 0; i < (int)g_offFiles.size(); ++i) {
                     bool sel = (g_selFile == i);
                     if (ImGui::Selectable(g_offFiles[i].c_str(), sel)) {
                         g_selFile = i;
-                        loadMeshBoundary(g_offFiles[i], fluid);
+                        loadMeshAndSetup(g_offFiles[i], fluid);
                     }
                 }
                 ImGui::EndCombo();
             }
-            if (g_selFile >= 0 && ImGui::Button("Rebuild SDF"))
-                loadMeshBoundary(g_offFiles[g_selFile], fluid);
+
+            ImGui::Spacing();
+            ImGui::BeginDisabled(g_anchors.empty());
+            if (ImGui::Button("Confirm Anchors & Spawn Fluid", ImVec2(-1, 0)))
+                confirmAnchorsAndSpawn(fluid, cfg.fluid);
+            ImGui::EndDisabled();
+            if (ImGui::Button("Clear Anchors")) { g_anchors.clear(); rebuildAnchorBuffer(); }
+            if (g_anchors.empty())
+                ImGui::TextDisabled("Place at least one anchor to continue.");
+        }
+        else if (g_dstate == DeformState::Ready) {
+            ImGui::TextWrapped("Fluid is frozen above the mesh. Press Start to release it.");
+            if (ImGui::Button("Start Simulation", ImVec2(180, 0))) g_dstate = DeformState::Running;
             ImGui::SameLine();
-            if (ImGui::Button("Rescan")) scanOffAssets();
+            if (ImGui::Button("Respawn")) respawnFluid(fluid, cfg.fluid);
+            ImGui::SameLine();
+            if (ImGui::Button("Back to Setup")) resetToSetup(fluid);
+        }
+        else if (g_dstate == DeformState::Running) {
+            if (ImGui::Button("Pause", ImVec2(120, 0))) g_dstate = DeformState::Paused;
+            ImGui::SameLine();
+            if (ImGui::Button("Respawn")) respawnFluid(fluid, cfg.fluid);
+            ImGui::SameLine();
+            if (ImGui::Button("Reset")) resetToSetup(fluid);
+        }
+        else if (g_dstate == DeformState::Paused) {
+            if (ImGui::Button("Resume", ImVec2(120, 0))) g_dstate = DeformState::Running;
+            ImGui::SameLine();
+            if (ImGui::Button("Respawn")) respawnFluid(fluid, cfg.fluid);
+            ImGui::SameLine();
+            if (ImGui::Button("Reset")) resetToSetup(fluid);
         }
 
-        ImGui::Separator(); ImGui::Text("Two-Way Coupling (Step 1: Contacts)");
-        ImGui::Checkbox("enableCoupling (contact forces + arrows)", &g_couplingEnabled);
-        ImGui::SliderFloat("contactRadius", &g_contactRadius, 0.01f, 0.5f, "%.3f");
-        ImGui::Checkbox("magnitude = velocity into surface", &g_useVelMagnitude);
-        ImGui::SliderFloat("arrowScale", &g_forceScale, 0.01f, 3.0f, "%.3f");
-        ImGui::SliderFloat("controlThreshold (handle enter)", &g_controlThreshold, 0.0f, 5.0f, "%.3f");
-        ImGui::SliderFloat("controlThresholdLow (handle exit)", &g_controlThresholdLow, 0.0f, 5.0f, "%.3f");
-        if (g_controlThresholdLow > g_controlThreshold) g_controlThresholdLow = g_controlThreshold;
-        ImGui::Text("contacts: %d   control pts: %d", g_contactCount, g_controlCount);
+        // ===== Presentation ======================================
+        ImGui::SeparatorText("Presentation");
+        ImGui::Checkbox("Show force arrows", &g_drawArrows);
+        if (g_drawArrows)
+            ImGui::SliderFloat("Arrow scale", &g_forceScale, 0.01f, 3.0f, "%.3f");
+        ImGui::SliderFloat("Point size", &pointSize, 1.0f, 40.0f);
 
-        ImGui::Separator(); ImGui::Text("Deformation (Step 3: anchors -> handles)");
-        {
-            const char* stateName =
-                g_dstate == DeformState::Inactive ? "Inactive" :
-                g_dstate == DeformState::Setup    ? "Setup (pick anchors)" :
-                g_dstate == DeformState::Ready    ? "Ready (paused)" :
-                g_dstate == DeformState::Running  ? "Running" : "Paused";
-            ImGui::Text("state: %s   anchors: %d   handles: %d   refactors: %d",
-                        stateName, (int)g_anchors.size(), g_handleCount, g_refactorCount);
+        // ===== Mesh & boundary (collapsed) =======================
+        if (ImGui::CollapsingHeader("Mesh & Boundary")) {
+            if (ImGui::Checkbox("Container mode (hold fluid inside)", &g_sdfContainer))
+                fluid.setSDFContainment(g_sdfContainer);
+            if (ImGui::SliderFloat("Surface padding", &g_sdfPadding, 0.0f, 0.2f, "%.3f"))
+                fluid.setSDFPadding(g_sdfPadding);
+            ImGui::SliderFloat("Mesh fit size", &g_sdfMeshSize, 0.5f, 20.0f);
+            ImGui::SliderFloat("SDF cell size", &g_sdfCell, 0.04f, 0.25f, "%.3f");
+            ImGui::SliderInt("Collision refresh (every N frames)", &g_sdfUpdateEvery, 1, 8);
+            if (ImGui::Button("Reload mesh (rebuild SDF)") && g_selFile >= 0)
+                loadMeshAndSetup(g_offFiles[g_selFile], fluid);
+            ImGui::SameLine();
+            if (ImGui::Button("Rescan assets")) scanOffAssets();
+        }
 
-            // Per-phase timing of the coupling hot path. The biggest number is the
-            // bottleneck to attack next. refactor==0 most frames means the handle
-            // set is stable (hysteresis working); a big refactor means the set
-            // churned -> enable incremental (AMD) or widen the hysteresis gap.
-            ImGui::Text("ms  contacts %.2f | refactor %.2f | solve %.2f | sdf %.2f | upload %.2f",
+        // ===== Deformation (collapsed) ===========================
+        if (ImGui::CollapsingHeader("Deformation")) {
+            ImGui::SliderFloat("Stiffness", &g_stiffness, 0.0f, 20.0f, "%.2f");
+            ImGui::SliderFloat("Max displacement / frame", &g_maxDisplacement, 0.001f, 0.5f, "%.3f");
+            ImGui::SliderFloat("Max total displacement", &g_maxTotalDisp, 0.01f, 2.0f, "%.3f");
+            ImGui::Checkbox("Elastic spring-back to rest", &g_restoreEnabled);
+            if (g_restoreEnabled)
+                ImGui::SliderFloat("Spring-back strength", &g_restoreStrength, 0.0f, 0.5f, "%.3f");
+
+            ImGui::SliderFloat("Contact radius", &g_contactRadius, 0.01f, 0.5f, "%.3f");
+            ImGui::Checkbox("Force from velocity into surface", &g_useVelMagnitude);
+            ImGui::SliderFloat("Handle enter threshold", &g_controlThreshold, 0.0f, 5.0f, "%.3f");
+            ImGui::SliderFloat("Handle exit threshold", &g_controlThresholdLow, 0.0f, 5.0f, "%.3f");
+            if (g_controlThresholdLow > g_controlThreshold) g_controlThresholdLow = g_controlThreshold;
+
+            bool localChanged = ImGui::Checkbox("Local patch solver (fast)", &g_useLocalDeform);
+            bool kChanged = false;
+            if (g_useLocalDeform)
+                kChanged = ImGui::SliderInt("Patch k-ring radius", &g_localKRing, 1, 8);
+            if ((localChanged || kChanged) && g_deformer) {
+                g_deformer->setUseLocal(g_useLocalDeform);
+                g_deformer->setLocalKRing(g_localKRing);
+                g_lastHandleSet.clear();   // force a precompute next frame
+            }
+        }
+
+        // ===== Advanced fluid (collapsed) ========================
+        if (ImGui::CollapsingHeader("Advanced - Fluid Solver")) {
+            ImGui::SeparatorText("Time & forces");
+            solverDirty |= ImGui::SliderFloat("dt", &cfg.fluid.dt, 1.f / 240.f, 1.f / 30.f);
+            solverDirty |= ImGui::SliderFloat3("Gravity", &cfg.fluid.gravity.x, -10.f, 10.f);
+
+            ImGui::SeparatorText("PBF");
+            solverDirty |= ImGui::SliderFloat("Smoothing radius h", &cfg.fluid.h, 0.01f, 0.30f);
+            solverDirty |= ImGui::SliderFloat("Rest density", &cfg.fluid.rho0, 100.f, 3000.f);
+            {
+                int v = (int)cfg.fluid.solverIterations;
+                if (ImGui::SliderInt("Solver iterations", &v, 1, 12)) { cfg.fluid.solverIterations = (U32)v; solverDirty = true; }
+            }
+            {
+                int v = (int)cfg.fluid.substepIterations;
+                if (ImGui::SliderInt("Substeps", &v, 1, 5)) { cfg.fluid.substepIterations = (U32)v; solverDirty = true; }
+            }
+            solverDirty |= ImGui::SliderFloat("Relaxation eps", &cfg.fluid.eps, 1e-8f, 1e-3f, "%.8f", ImGuiSliderFlags_Logarithmic);
+
+            ImGui::SeparatorText("Spawn (applied on next spawn)");
+            spawnDirty |= ImGui::Checkbox("Random spawn", &cfg.fluid.spawnRandom);
+            spawnDirty |= ImGui::SliderFloat("Spacing", &cfg.fluid.spacing, 0.005f, 0.15f);
+            spawnDirty |= ImGui::SliderFloat3("Spawn min", &cfg.fluid.spawnMin.x, -10.f, 10.f);
+            spawnDirty |= ImGui::SliderFloat3("Spawn max", &cfg.fluid.spawnMax.x, -10.f, 10.f);
+            spawnDirty |= ImGui::SliderFloat3("Initial velocity", &cfg.fluid.initialVelocity.x, -5.f, 5.f);
+
+            ImGui::SeparatorText("Domain bounds");
+            boundsDirty |= ImGui::SliderFloat3("Bounds min", &cfg.fluid.boundsMin.x, -20.0f, 20.f);
+            boundsDirty |= ImGui::SliderFloat3("Bounds max", &cfg.fluid.boundsMax.x, -20.0f, 20.f);
+            boundsDirty |= ImGui::SliderFloat("Wall damping", &cfg.fluid.boundDamping, 0.f, 1.f);
+
+            ImGui::SeparatorText("Surface tension (sCorr)");
+            scorrDirty |= ImGui::Checkbox("Enable sCorr", &cfg.fluid.enableSCorr);
+            scorrDirty |= ImGui::SliderFloat("kCorr", &cfg.fluid.kCorr, 0.f, 0.02f);
+            scorrDirty |= ImGui::SliderFloat("nCorr", &cfg.fluid.nCorr, 1.f, 8.f);
+            scorrDirty |= ImGui::SliderFloat("deltaQ", &cfg.fluid.deltaQ, 0.05f, 0.6f);
+
+            ImGui::SeparatorText("Cohesion & viscosity");
+            solverDirty |= ImGui::SliderFloat("Cohesion", &cfg.fluid.cohesionStrength, 0.0f, 0.05f, "%.4f");
+            solverDirty |= ImGui::Checkbox("Enable viscosity", &cfg.fluid.enableViscosity);
+            solverDirty |= ImGui::SliderFloat("Viscosity", &cfg.fluid.viscosity, 0.f, 0.2f);
+
+            ImGui::SeparatorText("Vorticity");
+            solverDirty |= ImGui::Checkbox("Enable vorticity", &cfg.fluid.enableVorticity);
+            solverDirty |= ImGui::SliderFloat("Vorticity epsilon", &cfg.fluid.vorticityEpsilon, 0.f, 1.f);
+
+            ImGui::SeparatorText("Mouse interaction");
+            solverDirty |= ImGui::SliderFloat("Interaction radius", &cfg.fluid.interactionRadius, 0.1f, 5.0f);
+            solverDirty |= ImGui::SliderFloat("Interaction strength", &cfg.fluid.interactionStrength, -20.0f, 20.0f);
+
+            ImGui::SeparatorText("Neighbor search & APBF");
+            {
+                int hs = (int)cfg.fluid.hashSize;
+                if (ImGui::InputInt("Hash size", &hs)) { if (hs < 1024) hs = 1024; cfg.fluid.hashSize = (U32)hs; solverDirty = true; }
+            }
+            solverDirty |= ImGui::Checkbox("Adaptive iterations (APBF)", &cfg.fluid.enableAPBF);
+            if (cfg.fluid.enableAPBF) {
+                int vmin = (int)cfg.fluid.minLOD, vmax = (int)cfg.fluid.maxLOD;
+                if (ImGui::SliderInt("minLOD", &vmin, 1, 8))  { cfg.fluid.minLOD = (U32)vmin; solverDirty = true; }
+                if (ImGui::SliderInt("maxLOD", &vmax, 1, 12)) { cfg.fluid.maxLOD = (U32)vmax; solverDirty = true; }
+                solverDirty |= ImGui::SliderFloat("LOD max distance", &cfg.fluid.lodMaxDist, 1.0f, 30.0f);
+            }
+        }
+
+        // ===== Diagnostics (collapsed) ===========================
+        if (ImGui::CollapsingHeader("Diagnostics")) {
+            ImGui::Text("Contacts %d   Control points %d", g_contactCount, g_controlCount);
+            ImGui::Text("Refactors %d", g_refactorCount);
+            ImGui::Text("ms: contacts %.2f | refactor %.2f | solve %.2f | sdf %.2f | upload %.2f",
                         g_msContacts, g_msRefactor, g_msSolve, g_msSdfUpdate, g_msSdfUpload);
             if (g_deformer && g_useLocalDeform) {
                 int ps = g_deformer->getLocalPatchSize();
-                if (ps > 0) ImGui::Text("patch interior: %d verts  (full mesh: %d)",
+                if (ps > 0) ImGui::Text("Patch interior %d verts (full mesh %d)",
                                         ps, (int)g_deformer->getMesh().n_vertices());
             }
-
-            const bool haveMesh = g_sdfEnabled && !g_meshData.verts.empty();
-
-            if (g_dstate == DeformState::Inactive) {
-                if (!haveMesh) ImGui::TextDisabled("Load an SDF mesh first.");
-                if (haveMesh && ImGui::Button("Setup Anchors (clears particles)"))
-                    enterSetup(fluid);
-            }
-            else if (g_dstate == DeformState::Setup) {
-                ImGui::TextWrapped("Left-click mesh vertices to toggle anchors (green).");
-                if (ImGui::Button("Confirm Anchors & Spawn"))
-                    confirmAnchorsAndSpawn(fluid, cfg.fluid);
-                ImGui::SameLine();
-                if (ImGui::Button("Clear Anchors")) { g_anchors.clear(); rebuildAnchorBuffer(); }
-                ImGui::SameLine();
-                if (ImGui::Button("Cancel")) { g_dstate = DeformState::Inactive; g_anchors.clear(); rebuildAnchorBuffer(); }
-            }
-            else if (g_dstate == DeformState::Ready) {
-                if (ImGui::Button("Start")) g_dstate = DeformState::Running;
-                ImGui::SameLine();
-                if (ImGui::Button("Back to Setup")) enterSetup(fluid);
-            }
-            else if (g_dstate == DeformState::Running) {
-                if (ImGui::Button("Pause")) g_dstate = DeformState::Paused;
-            }
-            else if (g_dstate == DeformState::Paused) {
-                if (ImGui::Button("Resume")) g_dstate = DeformState::Running;
-                ImGui::SameLine();
-                if (ImGui::Button("Back to Setup")) enterSetup(fluid);
-            }
-
-            ImGui::SliderFloat("stiffness", &g_stiffness, 0.0f, 20.0f, "%.2f");
-            ImGui::SliderFloat("maxDisplacement/frame", &g_maxDisplacement, 0.001f, 0.5f, "%.3f");
-            ImGui::SliderFloat("maxTotalDisplacement", &g_maxTotalDisp, 0.01f, 2.0f, "%.3f");
-
-            ImGui::Checkbox("restoring force (spring back to rest)", &g_restoreEnabled);
-            ImGui::SliderFloat("restoreStrength", &g_restoreStrength, 0.0f, 0.5f, "%.3f");
-
-            // Local patch solver controls (live-togglable).
-            {
-                bool localChanged = ImGui::Checkbox("localPatch solver (fast)", &g_useLocalDeform);
-                ImGui::SameLine(); ImGui::TextDisabled("(OFF = full-mesh CHOLMOD)");
-                bool kChanged = false;
-                if (g_useLocalDeform)
-                    kChanged = ImGui::SliderInt("k-ring radius", &g_localKRing, 1, 8);
-                if ((localChanged || kChanged) && g_deformer) {
-                    g_deformer->setUseLocal(g_useLocalDeform);
-                    g_deformer->setLocalKRing(g_localKRing);
-                    // Force a precompute on the next frame by clearing the cached handle set.
-                    g_lastHandleSet.clear();
-                }
-            }
-
-            // Hard reset: both solid and fluid back to their initial state.
-            if (ImGui::Button("HARD RESET (mesh + fluid)")) {
-                hardReset(fluid, cfg.fluid);
-                paused = true;   // leave it frozen at the initial state
-            }
         }
-
-        ImGui::Separator(); ImGui::Text("Neighbor Search");
-        {
-            int hs = (int)cfg.fluid.hashSize;
-            if (ImGui::InputInt("hashSize", &hs)) { if (hs < 1024) hs = 1024; cfg.fluid.hashSize = (U32)hs; solverDirty = true; }
-        }
-
-        ImGui::Separator(); ImGui::Text("sCorr");
-        bool scorrDirty = false;
-        scorrDirty |= ImGui::Checkbox("enableSCorr", &cfg.fluid.enableSCorr);
-        scorrDirty |= ImGui::SliderFloat("kCorr", &cfg.fluid.kCorr, 0.f, 0.02f);
-        scorrDirty |= ImGui::SliderFloat("nCorr", &cfg.fluid.nCorr, 1.f, 8.f);
-        scorrDirty |= ImGui::SliderFloat("deltaQ", &cfg.fluid.deltaQ, 0.05f, 0.6f);
-
-        ImGui::Separator(); ImGui::Text("Cohesion");
-        solverDirty |= ImGui::SliderFloat("cohesionStrength", &cfg.fluid.cohesionStrength, 0.0f, 0.05f, "%.4f");
-
-        ImGui::Separator(); ImGui::Text("Mouse Interaction");
-        solverDirty |= ImGui::SliderFloat("interactionRadius", &cfg.fluid.interactionRadius, 0.1f, 5.0f);
-        solverDirty |= ImGui::SliderFloat("interactionStrength", &cfg.fluid.interactionStrength, -20.0f, 20.0f);
-
-        ImGui::Separator(); ImGui::Text("Viscosity");
-        bool viscDirty = false;
-        viscDirty |= ImGui::Checkbox("enableViscosity", &cfg.fluid.enableViscosity);
-        viscDirty |= ImGui::SliderFloat("viscosity", &cfg.fluid.viscosity, 0.f, 0.2f);
-        if (viscDirty) solverDirty = true;
-
-        ImGui::Separator(); ImGui::Text("Vorticity Confinement");
-        bool vortDirty = false;
-        vortDirty |= ImGui::Checkbox("enableVorticity", &cfg.fluid.enableVorticity);
-        vortDirty |= ImGui::SliderFloat("epsilon", &cfg.fluid.vorticityEpsilon, 0.f, 1.f);
-        if (vortDirty) solverDirty = true;
-
-        ImGui::Separator(); ImGui::Text("APBF (Adaptive Iterations)");
-        bool apbfDirty = false;
-        apbfDirty |= ImGui::Checkbox("enableAPBF", &cfg.fluid.enableAPBF);
-        if (cfg.fluid.enableAPBF) {
-            {
-                int v = (int)cfg.fluid.minLOD;
-                if (ImGui::SliderInt("minLOD", &v, 1, 8)) { cfg.fluid.minLOD = (U32)v; apbfDirty = true; }
-            }
-            {
-                int v = (int)cfg.fluid.maxLOD;
-                if (ImGui::SliderInt("maxLOD", &v, 1, 12)) { cfg.fluid.maxLOD = (U32)v; apbfDirty = true; }
-            }
-            apbfDirty |= ImGui::SliderFloat("lodMaxDist", &cfg.fluid.lodMaxDist, 1.0f, 30.0f);
-        }
-        if (apbfDirty) solverDirty = true;
 
         ImGui::Separator();
-        ImGui::TextDisabled("LMB: interact  |  RMB: orbit  |  MMB: pan  |  Scroll: zoom");
+        ImGui::TextDisabled("LMB: pick anchors / interact   RMB: orbit   MMB: pan   Scroll: zoom");
         ImGui::End();
 
         // ---- Apply parameter changes ----------------------------
@@ -1411,34 +1408,33 @@ int main() {
             glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(boxData), boxData);
             glBindBuffer(GL_ARRAY_BUFFER, 0);
         }
-        if (spawnDirty) respawn = true;
-        if (respawn) {
+        // Spawn params only take effect on a (re)spawn. While the fluid is frozen
+        // (Ready) we can re-spawn live so the user sees the new block immediately.
+        if (spawnDirty && g_dstate == DeformState::Ready)
             fluid.setParticles(spawnParticles(cfg.fluid));
-            respawn = false;
-        }
 
         // ---- Two-way coupling: contacts (Step 1) + deform (Step 3) ----
         // Runs BEFORE fluid.step() on purpose. computeContactForces reads the
         // particle buffer the GPU finished during the PREVIOUS frame, so the
         // readback no longer blocks the CPU waiting on the step we are about to
-        // issue — that hard sync was the 100->30 FPS stall. As a bonus, deform
-        // updates the SDF before step() samples it, so the fluid collides
-        // against the latest shape. One-frame contact latency, invisible here.
-        // Contacts are needed when visualizing arrows OR when Running (handles
-        // come from these forces). Deformation runs only in the Running state.
-        const bool wantContacts = g_sdfEnabled &&
-                                  (g_couplingEnabled || g_dstate == DeformState::Running);
+        // issue. As a bonus, deform updates the SDF before step() samples it, so
+        // the fluid collides against the latest shape. One-frame latency, invisible.
+        //
+        // Contacts are needed while Running (they drive the deformation handles) and
+        // whenever the force-arrow overlay is shown over existing particles.
+        const bool haveFluid    = (g_dstate == DeformState::Running ||
+                                   g_dstate == DeformState::Paused);
+        const bool wantContacts = g_sdfEnabled && !g_meshData.verts.empty() &&
+                                  (g_dstate == DeformState::Running ||
+                                   (g_drawArrows && haveFluid));
         if (wantContacts) computeContactForces(fluid);
         else              g_arrowVertCount = 0;
 
         if (g_dstate == DeformState::Running) deformStep(fluid, cfg.fluid.dt);
 
         // ---- Simulation step (GPU only) -------------------------
-        // Inactive (legacy): driven by the paused/Step controls.
-        // Deformation states: only Running advances the fluid.
-        bool doStep = (g_dstate == DeformState::Inactive) ? (!paused || stepOnce)
-                                                          : (g_dstate == DeformState::Running);
-        if (doStep) {
+        // The fluid advances only while Running; every other workflow state is frozen.
+        if (g_dstate == DeformState::Running) {
             // Pass camera position for APBF LOD computation
             float cx = g_camDist * cosf(g_camPitch) * sinf(g_camYaw);
             float cy = g_camDist * sinf(g_camPitch);
@@ -1452,7 +1448,6 @@ int main() {
             // reads it at the TOP of the NEXT frame using the deferred fence, so this
             // costs zero CPU stall time here.
             if (wantContacts) fluid.filterContactCandidates(g_contactRadius);
-            stepOnce = false;
         }
 
         // ---- Clear -----------------------------------------------
