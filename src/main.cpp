@@ -47,14 +47,24 @@ static float g_camPitch = 0.35f;
 static float g_camDist = 12.5f;
 static glm::vec3 g_camTarget(1.0f, 1.0f, 1.0f);
 
+// Shift+Scroll mesh-rotation deltas are captured in scrollCB and applied in the
+// main loop (where the mesh can be rebuilt). Declared here so scrollCB can see it.
+static float g_scrollRotateAccum = 0.0f;
+
 static void framebufferCB(GLFWwindow*, int w, int h) {
     g_winW = w; g_winH = h;
     glViewport(0, 0, w, h);
 }
 
-static void scrollCB(GLFWwindow*, double, double yoff) {
+static void scrollCB(GLFWwindow* w, double, double yoff) {
     if (ImGui::GetIO().WantCaptureMouse) return;
-    g_camDist -= (float)yoff * 0.3f;
+    const bool shift = (glfwGetKey(w, GLFW_KEY_LEFT_SHIFT)  == GLFW_PRESS) ||
+                       (glfwGetKey(w, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
+    if (shift) {                       // Shift+Scroll rotates the mesh (applied in main loop)
+        g_scrollRotateAccum += (float)yoff;
+        return;
+    }
+    g_camDist -= (float)yoff * 0.3f;   // plain scroll = zoom
     g_camDist = glm::clamp(g_camDist, 0.3f, 30.0f);
 }
 
@@ -219,6 +229,18 @@ struct MeshData {
 // (No deformation here — forces are computed and visualized only.)
 // ===================================================================
 static MeshData            g_meshData;          // current fitted mesh (same coords as SDF/BVH)
+
+// ---- Mesh placement (PREPARATION step only) ----
+// During Setup the mesh can be moved/rotated before picking anchors and spawning.
+// g_meshData = g_meshBase transformed by (rotation about its center) then translation.
+// Edited via Shift+Right-drag (move), Shift+Scroll (rotate), or the panel sliders.
+// Once the fluid is running the placement is fixed (baked into the rest shape).
+static MeshData g_meshBase;                       // fitted mesh BEFORE the transform
+static PVec3    g_meshTranslate{ 0.f, 0.f, 0.f }; // world-space translation
+static PVec3    g_meshRotDeg{ 0.f, 0.f, 0.f };    // euler rotation in degrees (X,Y,Z)
+static int      g_rotAxis    = 1;                  // axis edited by Shift+Scroll (0=X,1=Y,2=Z)
+static float    g_rotStepDeg = 5.0f;               // degrees per scroll notch
+
 static std::vector<PVec3>  g_vertForces;         // accumulated push force, per mesh vertex
 static std::vector<ContactCandidate> g_candidateList; // GPU-filtered near-surface particles
 static std::vector<float>  g_arrowVerts;         // scratch: arrow line-segment vertices (xyz)
@@ -449,6 +471,12 @@ static void uploadMeshAndSDF(const MeshData& m, PBFluids& fluid) {
     // coupling can look up triangle vertices for barycentric force splitting.
     g_meshData = m;
     g_vertForces.assign(m.verts.size(), PVec3{ 0.f, 0.f, 0.f });
+
+    // This freshly loaded/fitted mesh becomes the base for placement transforms,
+    // and the transform resets to identity (the SDF above was built from the base).
+    g_meshBase      = m;
+    g_meshTranslate = PVec3{ 0.f, 0.f, 0.f };
+    g_meshRotDeg    = PVec3{ 0.f, 0.f, 0.f };
 }
 
 // Load mesh -> fit into domain -> build SDF -> attach -> draw. (obstacle by default)
@@ -692,6 +720,39 @@ static void buildDeformMeshFromData() {
         g_deformMesh.add_face(vh[f[0]], vh[f[1]], vh[f[2]]);
 }
 
+// Recompute g_meshData from the fitted base mesh with the current placement
+// (rotation about the mesh center, then translation) applied, and refresh the
+// wireframe + the pick/deform mesh so anchors and ray-picking stay aligned.
+//
+// Used only during the preparation (Setup) step. The collision SDF is NOT rebuilt
+// here — it is only needed once the fluid runs, so confirmAnchorsAndSpawn() rebuilds
+// it from the final placement. That keeps live dragging/rotating cheap.
+static void applyMeshTransform() {
+    if (g_meshBase.verts.empty() || g_meshBase.verts.size() != g_meshData.verts.size()) return;
+
+    // Pivot = bounding-box center of the base mesh, so rotation spins it in place.
+    double lo[3] = { 1e30, 1e30, 1e30 }, hi[3] = { -1e30, -1e30, -1e30 };
+    for (auto& v : g_meshBase.verts)
+        for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], v[k]); hi[k] = std::max(hi[k], v[k]); }
+    const glm::vec3 pivot(0.5f * (lo[0] + hi[0]), 0.5f * (lo[1] + hi[1]), 0.5f * (lo[2] + hi[2]));
+
+    glm::mat4 R(1.0f);
+    R = glm::rotate(R, glm::radians(g_meshRotDeg.x), glm::vec3(1, 0, 0));
+    R = glm::rotate(R, glm::radians(g_meshRotDeg.y), glm::vec3(0, 1, 0));
+    R = glm::rotate(R, glm::radians(g_meshRotDeg.z), glm::vec3(0, 0, 1));
+    const glm::vec3 T(g_meshTranslate.x, g_meshTranslate.y, g_meshTranslate.z);
+
+    for (size_t i = 0; i < g_meshBase.verts.size(); ++i) {
+        const auto& b = g_meshBase.verts[i];
+        const glm::vec3 p((float)b[0], (float)b[1], (float)b[2]);
+        const glm::vec3 q = glm::vec3(R * glm::vec4(p - pivot, 1.0f)) + pivot + T;
+        g_meshData.verts[i] = { (double)q.x, (double)q.y, (double)q.z };
+    }
+
+    updateMeshVBO();             // refresh wireframe positions (cheap sub-data upload)
+    buildDeformMeshFromData();   // rebuild pick/deform mesh so anchors/picking match
+}
+
 // Mark anchor vertices red in the per-vertex color VBO.
 // All other vertices stay at the default wireframe colour.
 static void rebuildAnchorBuffer() {
@@ -880,6 +941,16 @@ static void enterSetup(PBFluids& fluid) {
 // SETUP -> READY: build the anchors-only factorization, then spawn (paused).
 static void confirmAnchorsAndSpawn(PBFluids& fluid, const FluidConfig& fc) {
     if (g_anchors.empty()) { std::cerr << "[Deform] Pick at least one anchor first.\n"; return; }
+
+    // The mesh may have been moved/rotated during Setup; rebuild the collision SDF
+    // from its final placement before the fluid starts sampling it. (applyMeshTransform
+    // skips the SDF for cheap live editing, so this is where it gets refreshed.)
+    g_sdf.buildFromMesh(g_meshData.verts, g_meshData.faces, g_sdfCell, /*verbose=*/false);
+    g_sdf.uploadToGPU();
+    fluid.setSDFBoundary(&g_sdf);
+    fluid.setSDFPadding(g_sdfPadding);
+    fluid.setSDFContainment(g_sdfContainer);
+
     g_deformer = std::make_unique<LaplacianDeformation>(g_deformMesh);
     g_deformer->initialize();                     // rest differential coords + normal system (once)
     g_deformer->setUseLocal(g_useLocalDeform);
@@ -1080,16 +1151,48 @@ int main() {
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
             glfwSetWindowShouldClose(window, true);
 
-        // ---- Orbit camera (right drag) --------------------------
+        // Shift turns the mouse into mesh-placement controls, but ONLY during the
+        // preparation (Setup) step. Once the fluid is spawned the placement is fixed.
+        const bool shiftHeld = (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT)  == GLFW_PRESS) ||
+                               (glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
+        const bool meshEdit  = (g_dstate == DeformState::Setup) && !g_meshBase.verts.empty();
+
+        // ---- Right drag: orbit camera, or (Shift, in Setup) move the mesh ----
         if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS && !ImGui::GetIO().WantCaptureMouse) {
             double mx, my; glfwGetCursorPos(window, &mx, &my);
             if (!rightDown) { rightDown = true; lastRX = mx; lastRY = my; }
-            g_camYaw += (float)(mx - lastRX) * 0.005f;
-            g_camPitch += (float)(my - lastRY) * 0.005f;
-            g_camPitch = glm::clamp(g_camPitch, -1.5f, 1.5f);
+            const float dx = (float)(mx - lastRX), dy = (float)(my - lastRY);
+            if (shiftHeld && meshEdit) {
+                // Translate the mesh in the camera plane (drag right = +screen-right).
+                glm::mat4 V = viewMatrix();
+                glm::vec3 right(V[0][0], V[1][0], V[2][0]);
+                glm::vec3 up   (V[0][1], V[1][1], V[2][1]);
+                const float speed = g_camDist * 0.002f;
+                glm::vec3 d = (dx * right - dy * up) * speed;
+                g_meshTranslate += PVec3{ d.x, d.y, d.z };
+                applyMeshTransform();
+            } else {
+                g_camYaw   += dx * 0.005f;
+                g_camPitch += dy * 0.005f;
+                g_camPitch  = glm::clamp(g_camPitch, -1.5f, 1.5f);
+            }
             lastRX = mx; lastRY = my;
         }
         else { rightDown = false; }
+
+        // ---- Shift+Scroll: rotate the mesh about the chosen axis (Setup only) ----
+        if (g_scrollRotateAccum != 0.0f) {
+            if (meshEdit) {
+                float* axis = (g_rotAxis == 0) ? &g_meshRotDeg.x
+                            : (g_rotAxis == 1) ? &g_meshRotDeg.y : &g_meshRotDeg.z;
+                *axis += g_scrollRotateAccum * g_rotStepDeg;
+                applyMeshTransform();
+            } else {
+                // Shift+Scroll outside Setup falls back to zoom.
+                g_camDist = glm::clamp(g_camDist - g_scrollRotateAccum * 0.3f, 0.3f, 30.0f);
+            }
+            g_scrollRotateAccum = 0.0f;
+        }
 
         // ---- Pan camera (middle drag) ---------------------------
         if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS && !ImGui::GetIO().WantCaptureMouse) {
@@ -1117,11 +1220,12 @@ int main() {
             PVec3 hitPos{ 0,0,0 };
 
             if (g_dstate == DeformState::Setup) {
-                // Continuous paint mode: hold and drag left mouse to add anchors.
-                // Rays are cast every frame while the button is held; a vertex is
-                // added on first hit and ignored on subsequent hits (no toggling
-                // off while dragging). Use "Clear Anchors" to remove.
-                if (leftDown && g_deformMesh.n_vertices() > 0) {
+                // Continuous paint mode: hold Shift and drag left mouse to add anchors.
+                // Rays are cast every frame while held; a vertex is added on first hit
+                // and ignored on subsequent hits (no toggling off while dragging). Use
+                // "Clear Anchors" to remove. Shift gates this so Shift+Right-drag (move)
+                // and Shift+Scroll (rotate) don't accidentally drop anchors.
+                if (shiftHeld && leftDown && g_deformMesh.n_vertices() > 0) {
                     double mx, my; glfwGetCursorPos(window, &mx, &my);
                     Ray ray = screenToRay((float)mx, (float)my, g_winW, g_winH, V, P);
                     PickResult pr = pickVertex(ray, g_deformMesh);
@@ -1216,9 +1320,10 @@ int main() {
         ImGui::SeparatorText("Workflow");
 
         if (g_dstate == DeformState::Setup) {
-            ImGui::TextWrapped("Left-click vertices on the mesh to place anchor points "
-                               "(shown red). Anchors pin the shell so the fluid dents it "
-                               "in place instead of pushing it around.");
+            ImGui::TextWrapped("Shift + Left-click vertices to place anchor points (red) "
+                               "that pin the shell. Shift + Right-drag moves the mesh; "
+                               "Shift + Scroll rotates it about the axis chosen in "
+                               "Mesh & Boundary.");
 
             // Mesh choice — only meaningful before the fluid is spawned. Selecting
             // a mesh swaps it in and restarts the anchor-picking workflow.
@@ -1288,6 +1393,28 @@ int main() {
                 loadMeshAndSetup(g_offFiles[g_selFile], fluid);
             ImGui::SameLine();
             if (ImGui::Button("Rescan assets")) scanOffAssets();
+
+            // ---- Mesh placement: position + rotation (preparation step only) ----
+            ImGui::SeparatorText("Transform (Setup only)");
+            ImGui::BeginDisabled(g_dstate != DeformState::Setup);
+            {
+                const char* axisName[3] = { "X", "Y", "Z" };
+                g_rotAxis = (g_rotAxis < 0) ? 0 : (g_rotAxis > 2 ? 2 : g_rotAxis);
+                ImGui::SliderInt("Rotation axis (Shift+Scroll)", &g_rotAxis, 0, 2, axisName[g_rotAxis]);
+                ImGui::SliderFloat("Rotation step (deg/notch)", &g_rotStepDeg, 1.0f, 45.0f, "%.0f");
+
+                bool tChanged = false;
+                tChanged |= ImGui::SliderFloat3("Position", &g_meshTranslate.x, -3.0f, 3.0f, "%.2f");
+                tChanged |= ImGui::SliderFloat3("Rotation (deg)", &g_meshRotDeg.x, -180.0f, 180.0f, "%.0f");
+                if (tChanged) applyMeshTransform();
+
+                if (ImGui::Button("Reset transform")) {
+                    g_meshTranslate = PVec3{ 0.f, 0.f, 0.f };
+                    g_meshRotDeg    = PVec3{ 0.f, 0.f, 0.f };
+                    applyMeshTransform();
+                }
+            }
+            ImGui::EndDisabled();
         }
 
         // ===== Deformation (collapsed) ===========================
@@ -1394,7 +1521,8 @@ int main() {
         }
 
         ImGui::Separator();
-        ImGui::TextDisabled("LMB: pick anchors / interact   RMB: orbit   MMB: pan   Scroll: zoom");
+        ImGui::TextDisabled("Setup: Shift+LMB anchors | Shift+RMB move | Shift+Scroll rotate");
+        ImGui::TextDisabled("LMB interact | RMB orbit | MMB pan | Scroll zoom");
         ImGui::End();
 
         // ---- Apply parameter changes ----------------------------
