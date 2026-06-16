@@ -62,6 +62,14 @@ struct FluidConfigUBO {
 
 
 // ============================================================
+// Contact candidate written by CS_ContactFilter and read back by
+// computeContactForces().  Two vec4s so the struct packs naturally in std430.
+struct ContactCandidate {
+    PVec4 pos; // xyz: world position, w: unused
+    PVec4 vel; // xyz: velocity,       w: unused
+};
+
+// ============================================================
 // PBFluids
 // ------------------------------------------------------------
 // CPU prototype of Position-Based Fluids (PBF)
@@ -139,6 +147,20 @@ public:
     // detection). Call sparingly — the render path stays GPU-direct.
     void readbackParticles(std::vector<Particle>& out);
 
+    // GPU-side contact pre-filter: samples the SDF texture for every particle and
+    // writes only the near-surface ones (|sdf| < contactBand) to a compact SSBO.
+    // Call this AFTER fluid.step() so the filter covers the freshly integrated
+    // positions; it refreshes the readback fence so readbackContactCandidates()
+    // called at the top of the NEXT frame won't stall the CPU.
+    // No-op when no SDF boundary is attached or contactBand <= 0.
+    void filterContactCandidates(float contactBand);
+
+    // Read the compact candidate list produced by the last filterContactCandidates()
+    // call.  Uses the same deferred fence as readbackParticles — call at the TOP of
+    // the frame, before the next step(), so the fence is already signalled and the
+    // map is unsynchronised.
+    void readbackContactCandidates(std::vector<ContactCandidate>& out);
+
 private:
     // apply forces + predict x*
     void applyForcesAndPredict();
@@ -205,8 +227,21 @@ private:
 
     // APBF: per-particle LOD (solver iterations assigned by camera distance)
     SSBO<U32> _ssboLOD;        // Binding 7
+
+    // GPU contact pre-filter output (written by CS_ContactFilter)
+    SSBO<U32>              _ssboContactCount;      // Binding 6 — single uint atomic counter
+    SSBO<ContactCandidate> _ssboContactCandidates; // Binding 8 — compact near-surface list
+
     PVec3 _cameraPos{ 0, 0, 0 };
     void initLODBuffer();
+
+    // Fence covering the last GPU work that wrote to the contact buffers.
+    // Set by step() as a fallback, then superseded by filterContactCandidates()
+    // which appends a filter dispatch after step().  readbackContactCandidates()
+    // (called at the TOP of the next frame, before the next step()) waits on it —
+    // by then it is already signalled, so the wait returns immediately and the
+    // maps can use GL_MAP_UNSYNCHRONIZED_BIT with zero CPU stall.
+    GLsync _readbackFence = nullptr;
 
     // SDF solid boundary (non-owning). Queried in CS_Integrate via sampler3D
     // bound to texture unit kSDFTextureUnit.
@@ -229,6 +264,7 @@ private:
     ComputeShader _csIntegrate;
     ComputeShader _csVorticity;
     ComputeShader _csComputeLOD;
+    ComputeShader _csContactFilter;
 };
 
 #endif

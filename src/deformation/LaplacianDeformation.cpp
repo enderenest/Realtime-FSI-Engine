@@ -1,5 +1,8 @@
 #include "deformation/LaplacianDeformation.h"
+#include <algorithm>
+#include <iterator>
 #include <iostream>
+#include <unordered_set>
 
 LaplacianDeformation::LaplacianDeformation(MyMesh& mesh) : _mesh(mesh) {
     _mesh.add_property(_cotangentWeights, "cotangent_weights");
@@ -14,6 +17,61 @@ void LaplacianDeformation::initialize() {
     computeCotangentWeights();
     buildLaplacianMatrix();
     computeDifferentialCoordinates();
+    // Note: the n x n normal system (_A, _bX/Y/Z) is built lazily by the
+    // incremental path on first use (buildNormalSystem), so the default soft
+    // solver pays nothing for it.
+}
+
+// Build the n x n normal matrix A = L^T L (symmetric, SPD once >= 1 vertex is
+// constrained) and the per-axis gradient RHS b = L^T delta. A tiny diagonal
+// regularization keeps the detached system safely positive-definite. This is
+// the persistent system the incremental factor lives on (Step 1 / Step 2).
+void LaplacianDeformation::buildNormalSystem() {
+    const int n = (int)_mesh.n_vertices();
+    if (n == 0) return;
+
+    ESparseMatrix Lt = _laplacian.transpose();
+    _A = (Lt * _laplacian).pruned();
+
+    constexpr double kReg = 1e-8;     // regularize the constant nullspace of L^T L
+    for (int k = 0; k < n; ++k) _A.coeffRef(k, k) += kReg;
+    _A.makeCompressed();
+
+    _bX = Lt * _deltaX;
+    _bY = Lt * _deltaY;
+    _bZ = Lt * _deltaZ;
+
+    // ---- AMD fill-reducing reordering (computed ONCE; _A never changes) ------
+    // Eigen's AMDOrdering writes P.indices()[newIdx] = originalVertex, i.e. the
+    // reordered matrix is A(perm, perm). We build _Aperm = P A P^T explicitly so
+    // the core IncrementalCholesky factorizes the bushy-etree ordering instead of
+    // the natural chain. Everything that indexes the factor (constraint mask,
+    // changed columns, solve RHS/solution) is mapped through _perm/_invPerm.
+    {
+        Eigen::AMDOrdering<int> ordering;
+        Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int> P;
+        ordering(_A.selfadjointView<Eigen::Upper>(), P);   // P.indices()[new] = old
+
+        _perm.assign(n, 0);
+        _invPerm.assign(n, 0);
+        for (int i = 0; i < n; ++i) {
+            _perm[i] = P.indices()(i);
+            _invPerm[_perm[i]] = i;
+        }
+
+        // _Aperm(a,b) = _A(perm[a], perm[b]); place original (i,j) at (invPerm[i], invPerm[j]).
+        std::vector<ETriplet> trips;
+        trips.reserve(_A.nonZeros());
+        for (int k = 0; k < _A.outerSize(); ++k)
+            for (ESparseMatrix::InnerIterator it(_A, k); it; ++it)
+                trips.emplace_back(_invPerm[(int)it.row()], _invPerm[(int)it.col()], it.value());
+        _Aperm.resize(n, n);
+        _Aperm.setFromTriplets(trips.begin(), trips.end());
+        _Aperm.makeCompressed();
+    }
+
+    _incReady = false;
+    _prevConstrained.clear();
 }
 
 void LaplacianDeformation::computeCotangentWeights() {
@@ -132,6 +190,206 @@ void LaplacianDeformation::computeDifferentialCoordinates() {
     //std::cout << "Differential coordinates computed for " << vertexCount << " vertices.\n";
 }
 
+// ============================================================
+// Local patch deformation
+// ============================================================
+
+std::vector<int> LaplacianDeformation::extractKRing(const std::vector<int>& seeds, int k) const {
+    std::unordered_set<int> visited;
+    std::vector<int> frontier;
+    for (int s : seeds)
+        if (visited.insert(s).second) frontier.push_back(s);
+
+    for (int hop = 0; hop < k; ++hop) {
+        std::vector<int> next;
+        for (int v : frontier) {
+            for (auto nb = _mesh.cvv_iter(OpenMesh::VertexHandle(v)); nb.is_valid(); ++nb) {
+                int j = nb->idx();
+                if (visited.insert(j).second) next.push_back(j);
+            }
+        }
+        frontier = std::move(next);
+    }
+    return std::vector<int>(visited.begin(), visited.end());
+}
+
+void LaplacianDeformation::precomputeLocalSystem() {
+    _local.ready = false;
+
+    // Seed the k-ring BFS from all active handles (and legacy single control).
+    std::vector<int> seeds;
+    for (int h : _controlIndices) seeds.push_back(h);
+    if (_controlIndex >= 0) seeds.push_back(_controlIndex);
+    if (seeds.empty()) return;
+
+    // Anchors are treated as fixed boundaries — exclude them from the interior.
+    std::unordered_set<int> anchorSet(_anchorIndices.begin(), _anchorIndices.end());
+
+    std::vector<int> kring = extractKRing(seeds, _localKRing);
+
+    // Partition k-ring into interior (solved) vs. anchor-in-ring (fixed boundary).
+    _local.interior.clear();
+    _local.g2l.clear();
+    _local.notInteriorList.clear();
+    _local.notI_g2l.clear();
+
+    for (int v : kring) {
+        if (anchorSet.count(v)) {
+            if (!_local.notI_g2l.count(v)) {
+                _local.notI_g2l[v] = (int)_local.notInteriorList.size();
+                _local.notInteriorList.push_back(v);
+            }
+        } else {
+            _local.g2l[v] = (int)_local.interior.size();
+            _local.interior.push_back(v);
+        }
+    }
+
+    const int ni = (int)_local.interior.size();
+    if (ni == 0) return;
+
+    // Build sub-Laplacian Lii (interior × interior) and Li_notI (interior × boundary).
+    // Any neighbour of an interior vertex that is NOT interior becomes a notInterior entry.
+    std::vector<ETriplet> tripsII, tripsInotI;
+    for (int li = 0; li < ni; ++li) {
+        int gi = _local.interior[li];
+        OpenMesh::VertexHandle vh(gi);
+
+        double weightSum = 0.0;
+        for (auto nb = _mesh.cvv_iter(vh); nb.is_valid(); ++nb) {
+            auto eh = _mesh.edge_handle(_mesh.find_halfedge(vh, *nb));
+            weightSum += _mesh.property(_cotangentWeights, eh);
+        }
+        if (weightSum < 1e-12) weightSum = 1e-12;
+
+        tripsII.emplace_back(li, li, 1.0);
+
+        for (auto nb = _mesh.cvv_iter(vh); nb.is_valid(); ++nb) {
+            int gj = nb->idx();
+            auto eh = _mesh.edge_handle(_mesh.find_halfedge(vh, *nb));
+            double w = _mesh.property(_cotangentWeights, eh) / weightSum;
+
+            auto it = _local.g2l.find(gj);
+            if (it != _local.g2l.end()) {
+                tripsII.emplace_back(li, it->second, -w);
+            } else {
+                auto it2 = _local.notI_g2l.find(gj);
+                if (it2 == _local.notI_g2l.end()) {
+                    int idx = (int)_local.notInteriorList.size();
+                    _local.notI_g2l[gj] = idx;
+                    _local.notInteriorList.push_back(gj);
+                    it2 = _local.notI_g2l.find(gj);
+                }
+                tripsInotI.emplace_back(li, it2->second, -w);
+            }
+        }
+    }
+
+    const int n_notI = (int)_local.notInteriorList.size();
+    _local.Lii.resize(ni, ni);
+    _local.Lii.setFromTriplets(tripsII.begin(), tripsII.end());
+    _local.Li_notI.resize(ni, n_notI);
+    _local.Li_notI.setFromTriplets(tripsInotI.begin(), tripsInotI.end());
+    _local.LiiT = _local.Lii.transpose();
+
+    // Rest-pose differential coordinates restricted to interior rows.
+    _local.restDX.resize(ni);
+    _local.restDY.resize(ni);
+    _local.restDZ.resize(ni);
+    for (int li = 0; li < ni; ++li) {
+        int gi = _local.interior[li];
+        _local.restDX(li) = _deltaX(gi);
+        _local.restDY(li) = _deltaY(gi);
+        _local.restDZ(li) = _deltaZ(gi);
+    }
+
+    // Record which interior vertices are handles (global and local index).
+    _local.localHandleIdx.clear();
+    _local.globalHandleIdx.clear();
+    for (int h : _controlIndices) {
+        auto it = _local.g2l.find(h);
+        if (it != _local.g2l.end()) {
+            _local.localHandleIdx.push_back(it->second);
+            _local.globalHandleIdx.push_back(h);
+        }
+    }
+    if (_controlIndex >= 0) {
+        auto it = _local.g2l.find(_controlIndex);
+        if (it != _local.g2l.end()) {
+            _local.localHandleIdx.push_back(it->second);
+            _local.globalHandleIdx.push_back(_controlIndex);
+        }
+    }
+
+    const int nc = (int)_local.localHandleIdx.size();
+    if (nc == 0) return;  // All handles ended up outside the k-ring (shouldn't happen)
+
+    // AtA = Lii^T Lii + I_handles (normal equations for [Lii; I_handles]^T).
+    _local.AtA = (_local.LiiT * _local.Lii).pruned();
+    for (int c = 0; c < nc; ++c)
+        _local.AtA.coeffRef(_local.localHandleIdx[c], _local.localHandleIdx[c]) += 1.0;
+
+    _local.solver.compute(_local.AtA);
+    if (_local.solver.info() != Eigen::Success) {
+        std::cerr << "[local] LDLT factorization failed (ni=" << ni << ").\n";
+        return;
+    }
+
+    _local.ready = true;
+}
+
+void LaplacianDeformation::solveLocal() {
+    if (!_local.ready) return;
+
+    const int ni     = (int)_local.interior.size();
+    const int n_notI = (int)_local.notInteriorList.size();
+
+    // Gather current positions of boundary (notInterior) vertices.
+    EVecX notI_X(n_notI), notI_Y(n_notI), notI_Z(n_notI);
+    for (int i = 0; i < n_notI; ++i) {
+        auto p = _mesh.point(OpenMesh::VertexHandle(_local.notInteriorList[i]));
+        notI_X(i) = p[0]; notI_Y(i) = p[1]; notI_Z(i) = p[2];
+    }
+
+    // b_smooth = restDelta_I - Li_notI * x_notI_current
+    // Accounts for the fact that boundary vertices may have drifted from rest.
+    EVecX bX = _local.restDX - _local.Li_notI * notI_X;
+    EVecX bY = _local.restDY - _local.Li_notI * notI_Y;
+    EVecX bZ = _local.restDZ - _local.Li_notI * notI_Z;
+
+    // RHS = Lii^T * b_smooth  (normal equations top half)
+    EVecX rhsX = _local.LiiT * bX;
+    EVecX rhsY = _local.LiiT * bY;
+    EVecX rhsZ = _local.LiiT * bZ;
+
+    // Add constraint contributions: for each handle c, rhs[local_c] += target_c
+    // (corresponds to the A^T * b_constraint block of the normal equations).
+    for (int c = 0; c < (int)_local.localHandleIdx.size(); ++c) {
+        int gv = _local.globalHandleIdx[c];
+        EVec3 t = EVec3::Zero();
+        // Look up the current target for this global vertex.
+        for (int i = 0; i < (int)_controlIndices.size(); ++i)
+            if (_controlIndices[i] == gv) { t = _controlTargets[i]; break; }
+        if (_controlIndex == gv) t = _controlTarget;
+        int li = _local.localHandleIdx[c];
+        rhsX(li) += t.x();
+        rhsY(li) += t.y();
+        rhsZ(li) += t.z();
+    }
+
+    // Solve AtA * x_I = rhs for each axis.
+    EVecX solvedX = _local.solver.solve(rhsX);
+    EVecX solvedY = _local.solver.solve(rhsY);
+    EVecX solvedZ = _local.solver.solve(rhsZ);
+
+    // Write back only the interior patch vertices; everything else is untouched.
+    for (int li = 0; li < ni; ++li) {
+        int gi = _local.interior[li];
+        _mesh.set_point(OpenMesh::VertexHandle(gi),
+                        MyMesh::Point(solvedX(li), solvedY(li), solvedZ(li)));
+    }
+}
+
 void LaplacianDeformation::clearConstraints() {
     _anchorIndices.clear();
     _anchorPositions.clear();
@@ -174,7 +432,64 @@ void LaplacianDeformation::clearControlPoints() {
     _controlTargets.clear();
 }
 void LaplacianDeformation::precomputeSystem() {
-    //std::cout << "Precomputing solver system...\n";
+    // ---- Local patch path (default, fast) -----------------------------------
+    if (_useLocal) { precomputeLocalSystem(); return; }
+
+    // ---- Incremental Cholesky path (hard constraints, Eq.14 + Alg.3) --------
+    if (_useIncremental) {
+        const int n = (int)_mesh.n_vertices();
+        std::vector<int> cur = currentConstrainedSorted();
+        if (cur.empty()) {
+            std::cerr << "[Laplacian/inc] Cannot precompute: no constraints.\n";
+            return;
+        }
+
+        if (!_incReady) {
+            // First time: build the persistent normal system (incl. AMD order),
+            // then the elimination tree (once) on the PERMUTED matrix.
+            buildNormalSystem();
+            _inc.analyze(_Aperm);
+            _incReady = true;
+        }
+
+        // Constraint mask in ORIGINAL order (used by the solve, which assembles
+        // its RHS from _A) and in PERMUTED order (used by the factor).
+        _constrainedMask.assign(n, 0);
+        std::vector<char> maskPerm(n, 0);
+        for (int v : cur) { _constrainedMask[v] = 1; maskPerm[_invPerm[v]] = 1; }
+        _inc.setConstrained(maskPerm);
+
+        if (_prevConstrained.empty()) {
+            // No prior state to diff against: full factorization of A^B.
+            _inc.factorizeFull(_Aperm);
+        } else {
+            // Set changed: I0 = entering ∪ leaving (symmetric difference), plus
+            // their neighbours (the columns of A^B whose entries actually moved),
+            // mapped to permuted indices. Algorithm 3 recomputes only the etree
+            // paths from I0.
+            std::vector<int> changed;
+            std::set_symmetric_difference(cur.begin(), cur.end(),
+                                          _prevConstrained.begin(), _prevConstrained.end(),
+                                          std::back_inserter(changed));
+
+            std::vector<int> I0;
+            I0.reserve(changed.size() * 8);
+            std::vector<char> seen(n, 0);   // indexed by PERMUTED column
+            auto push = [&](int origV) {
+                const int p = _invPerm[origV];
+                if (!seen[p]) { seen[p] = 1; I0.push_back(p); }
+            };
+            for (int v : changed) {
+                push(v);
+                for (ESparseMatrix::InnerIterator it(_A, v); it; ++it) push((int)it.row());
+            }
+
+            _inc.updateColumns(_Aperm, I0);
+        }
+
+        _prevConstrained = std::move(cur);
+        return;
+    }
 
     int vertexCount = _mesh.n_vertices();
     int constraintCount = _anchorIndices.size() + (_controlIndex >= 0 ? 1 : 0)
@@ -233,6 +548,27 @@ void LaplacianDeformation::precomputeSystem() {
     //          << constraintCount << " constraints.\n";
 }
 void LaplacianDeformation::solve() {
+    // ---- Local patch path ---------------------------------------------------
+    if (_useLocal) { solveLocal(); return; }
+
+    // ---- Incremental Cholesky path: three RHS share the persistent factor ----
+    if (_useIncremental) {
+        if (!_incReady) { std::cerr << "[Laplacian/inc] solve before precompute.\n"; return; }
+        const int n = (int)_mesh.n_vertices();
+
+        EVecX tx(n), ty(n), tz(n);
+        gatherConstraintTargets(tx, ty, tz);
+
+        EVecX x(n), y(n), z(n);
+        solveAxisIncremental(_bX, tx, x);
+        solveAxisIncremental(_bY, ty, y);
+        solveAxisIncremental(_bZ, tz, z);
+
+        for (int i = 0; i < n; ++i)
+            _mesh.set_point(OpenMesh::VertexHandle(i), MyMesh::Point(x(i), y(i), z(i)));
+        return;
+    }
+
     int vertexCount = _mesh.n_vertices();
     int totalRows = vertexCount + _anchorIndices.size() + (_controlIndex >= 0 ? 1 : 0)
                   + (int)_controlIndices.size();
@@ -280,4 +616,102 @@ void LaplacianDeformation::solve() {
     for (int i = 0; i < vertexCount; ++i) {
         _mesh.set_point(OpenMesh::VertexHandle(i), MyMesh::Point(solvedX(i), solvedY(i), solvedZ(i)));
     }
+}
+
+// ============================================================
+// Incremental Cholesky helpers
+// ============================================================
+
+std::vector<int> LaplacianDeformation::currentConstrainedSorted() const {
+    std::vector<int> c = _anchorIndices;
+    if (_controlIndex >= 0) c.push_back(_controlIndex);
+    c.insert(c.end(), _controlIndices.begin(), _controlIndices.end());
+    std::sort(c.begin(), c.end());
+    c.erase(std::unique(c.begin(), c.end()), c.end());
+    return c;
+}
+
+void LaplacianDeformation::gatherConstraintTargets(EVecX& tx, EVecX& ty, EVecX& tz) const {
+    const int n = (int)_mesh.n_vertices();
+    tx.setZero(n); ty.setZero(n); tz.setZero(n);
+    auto set = [&](int v, const EVec3& p) { tx(v) = p.x(); ty(v) = p.y(); tz(v) = p.z(); };
+
+    for (size_t i = 0; i < _anchorIndices.size(); ++i) set(_anchorIndices[i], _anchorPositions[i]);
+    if (_controlIndex >= 0) set(_controlIndex, _controlTarget);
+    for (size_t i = 0; i < _controlIndices.size(); ++i) set(_controlIndices[i], _controlTargets[i]);
+}
+
+void LaplacianDeformation::solveAxisIncremental(const EVecX& b, const EVecX& targets,
+                                                EVecX& outX) const {
+    const int n = (int)_mesh.n_vertices();
+
+    // rhs starts at the gradient b = L^T delta. Move every constrained column's
+    // contribution to the RHS (free rows i: rhs_i -= A_ik * c_k), exactly the
+    // A_IC c_C correction that the detached matrix A^B no longer carries.
+    EVecX rhs = b;
+    for (int k = 0; k < n; ++k) {
+        if (!_constrainedMask[k]) continue;
+        const double ck = targets(k);
+        for (ESparseMatrix::InnerIterator it(_A, k); it; ++it)
+            rhs(it.row()) -= it.value() * ck;
+    }
+    // Pin constrained rows to their targets (A^B has identity rows there, so the
+    // solve returns x_k = rhs_k). Overwrites the self-subtraction above.
+    for (int k = 0; k < n; ++k)
+        if (_constrainedMask[k]) rhs(k) = targets(k);
+
+    // The factor lives in AMD-permuted space: gather rhs -> solve -> scatter back.
+    EVecX rhsP(n);
+    for (int i = 0; i < n; ++i) rhsP(i) = rhs(_perm[i]);    // rhsP[new] = rhs[old]
+    _inc.solveInPlace(rhsP);
+    outX.resize(n);
+    for (int i = 0; i < n; ++i) outX(_perm[i]) = rhsP(i);   // outX[old] = sol[new]
+}
+
+double LaplacianDeformation::verifyIncremental() {
+    if (!_useIncremental || !_incReady) return -1.0;
+    const int n = (int)_mesh.n_vertices();
+
+    // Build A^B explicitly (Eq.14) and factor it with a fresh Eigen LDLT.
+    ESparseMatrix AB(n, n);
+    {
+        std::vector<ETriplet> trips;
+        trips.reserve(_A.nonZeros());
+        for (int k = 0; k < _A.outerSize(); ++k)
+            for (ESparseMatrix::InnerIterator it(_A, k); it; ++it) {
+                const int i = (int)it.row(), j = (int)it.col();
+                if (_constrainedMask[i] || _constrainedMask[j]) {
+                    if (i == j) trips.emplace_back(i, j, 1.0);   // identity diagonal
+                } else {
+                    trips.emplace_back(i, j, it.value());
+                }
+            }
+        AB.setFromTriplets(trips.begin(), trips.end());
+    }
+
+    EVecX tx(n), ty(n), tz(n);
+    gatherConstraintTargets(tx, ty, tz);
+
+    EVecX rhs = _bX;
+    for (int k = 0; k < n; ++k) {
+        if (!_constrainedMask[k]) continue;
+        for (ESparseMatrix::InnerIterator it(_A, k); it; ++it) rhs(it.row()) -= it.value() * tx(k);
+    }
+    for (int k = 0; k < n; ++k) if (_constrainedMask[k]) rhs(k) = tx(k);
+
+    ELDLTSolver eig;
+    eig.compute(AB);
+    if (eig.info() != Eigen::Success) { std::cerr << "[inc verify] Eigen factor failed\n"; return -2.0; }
+    const EVecX xEig = eig.solve(rhs);
+
+    // _inc factorized the AMD-permuted A^B, so round-trip the RHS/solution.
+    EVecX rhsP(n);
+    for (int i = 0; i < n; ++i) rhsP(i) = rhs(_perm[i]);
+    _inc.solveInPlace(rhsP);
+    EVecX xInc(n);
+    for (int i = 0; i < n; ++i) xInc(_perm[i]) = rhsP(i);
+
+    const double maxDiff = (xInc - xEig).cwiseAbs().maxCoeff();
+    std::cout << "[inc verify] max |x_inc - x_eigen| = " << maxDiff << "\n";
+    return maxDiff;
 }

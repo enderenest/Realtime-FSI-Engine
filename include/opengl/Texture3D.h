@@ -26,6 +26,13 @@ public:
     // 'data' must be in texture order: index = x + width * (y + height * z).
     void upload(int width, int height, int depth, const std::vector<float>& data);
 
+    // Update a sub-box of the already-allocated volume via glTexSubImage3D (the
+    // dirty-update path). Offset (x0,y0,z0) and extent (w,h,d) are in voxels;
+    // 'data' must be w*h*d floats in sub-box texture order: i = x + w*(y + h*z).
+    // No-op if storage has not been allocated yet (call upload() first).
+    void uploadSubRegion(int x0, int y0, int z0, int w, int h, int d,
+                         const std::vector<float>& data);
+
     // Bind to a texture image unit for sampling (sampler3D in GLSL).
     void bindToUnit(GLuint unit) const;
 

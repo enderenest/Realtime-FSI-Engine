@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <omp.h>
 
@@ -101,6 +103,48 @@ public:
         _nodes.clear();
         _nodes.reserve(2 * std::max(1, n));
         if (n > 0) buildRecursive(0, n);
+    }
+
+    // Refit node boxes in place after the triangles moved but the topology and
+    // the tree structure are unchanged (two-way coupling). O(F): recompute each
+    // triangle's AABB from its current corners, then resize every node box.
+    //
+    // buildRecursive emplaces a parent BEFORE recursing into its children, so a
+    // node's children always have HIGHER indices than the node itself. A single
+    // reverse pass over the flat node array therefore visits every child before
+    // its parent — a valid bottom-up merge without recursion.
+    //
+    // Falls back to a full build if the structure does not match the triangle
+    // list (e.g. first call, or topology changed) so a misuse can never query a
+    // stale tree.
+    void refit(const std::vector<Tri>& tris) {
+        if (_nodes.empty() || tris.size() != _order.size()) { build(tris); return; }
+        _tris = &tris;
+
+        const int n = static_cast<int>(tris.size());
+        for (int i = 0; i < n; ++i) {
+            const Tri& t = tris[i];
+            _triAABBMin[i] = t.A.cwiseMin(t.B).cwiseMin(t.C);
+            _triAABBMax[i] = t.A.cwiseMax(t.B).cwiseMax(t.C);
+        }
+
+        for (int i = static_cast<int>(_nodes.size()) - 1; i >= 0; --i) {
+            Node& node = _nodes[i];
+            if (node.left == -1) {   // leaf — box over its triangles' AABBs
+                Eigen::Vector3d bmin( 1e30,  1e30,  1e30);
+                Eigen::Vector3d bmax(-1e30, -1e30, -1e30);
+                for (int k = node.start; k < node.start + node.count; ++k) {
+                    const int t = _order[k];
+                    bmin = bmin.cwiseMin(_triAABBMin[t]);
+                    bmax = bmax.cwiseMax(_triAABBMax[t]);
+                }
+                node.bmin = bmin;
+                node.bmax = bmax;
+            } else {                 // internal — merge children
+                node.bmin = _nodes[node.left].bmin.cwiseMin(_nodes[node.right].bmin);
+                node.bmax = _nodes[node.left].bmax.cwiseMax(_nodes[node.right].bmax);
+            }
+        }
     }
 
     // Nearest point on the mesh surface to P (with feature + triangle index).
@@ -226,8 +270,9 @@ private:
 // contact queries. bvh stores a pointer into tris, so this object must outlive
 // any query and must not be relocated (it lives on the heap via shared_ptr).
 struct SDFBoundary::Accel {
-    std::vector<Tri> tris;
-    TriangleBVH      bvh;
+    std::vector<Tri>             tris;
+    std::vector<Eigen::Vector3d> vertNormals;  // angle-weighted per-vertex (for VERTEX-feature sign)
+    TriangleBVH                  bvh;
 };
 
 void SDFBoundary::buildFromMesh(
@@ -265,6 +310,13 @@ void SDFBoundary::buildFromMesh(
     const int total = _dimensions.x() * _dimensions.y() * _dimensions.z();
     _distances.assign(total, 0.0f);
 
+    // Baseline for the dirty path: remember the positions this grid was built
+    // from, and (re)size the dirty mask to the grid.
+    _buildVerts = verts;
+    _dirtyMask.assign(total, 0);
+    _dirtyList.clear();
+    _dirtyValid = false;
+
     // Build the triangle list with per-feature pseudo-normals. Stored in _accel
     // (on the heap) so the list + BVH survive the build for later contact queries.
     _accel = std::make_shared<Accel>();
@@ -287,7 +339,8 @@ void SDFBoundary::buildFromMesh(
     // Angle-weighted vertex normals: each incident face weighted by its interior
     // angle at that vertex so skinny triangles don't dominate.
     const int numVerts = static_cast<int>(verts.size());
-    std::vector<Eigen::Vector3d> vertNormals(numVerts, Eigen::Vector3d::Zero());
+    std::vector<Eigen::Vector3d>& vertNormals = _accel->vertNormals;
+    vertNormals.assign(numVerts, Eigen::Vector3d::Zero());
     for (const auto& tri : tris) {
         auto accumulate = [&](int vi, const Eigen::Vector3d& vtx,
                               const Eigen::Vector3d& p1, const Eigen::Vector3d& p2) {
@@ -332,10 +385,41 @@ void SDFBoundary::buildFromMesh(
     // Spatial acceleration: build a BVH once, then each voxel queries it in
     // O(log F). This replaces the old O(voxels * triangles) brute-force scan.
     // Kept in _accel so closestTriangle() can reuse it after the build.
-    TriangleBVH& bvh = _accel->bvh;
-    bvh.build(tris);
+    _accel->bvh.build(tris);
 
-	// enable CPU parallelism over the voxel grid
+    // Fill the distance grid by querying the BVH at every voxel center.
+    recomputeDistances();
+
+    if (verbose) {
+        std::cout << "SDF computed: "
+                  << _dimensions.x() << "x" << _dimensions.y() << "x" << _dimensions.z()
+                  << " (" << total << " voxels, " << tris.size() << " triangles, BVH)\n";
+    }
+}
+
+float SDFBoundary::signedDistanceAt(const Eigen::Vector3d& P) const {
+    const std::vector<Tri>&             tris        = _accel->tris;
+    const std::vector<Eigen::Vector3d>& vertNormals = _accel->vertNormals;
+
+    const TriangleBVH::Hit hit = _accel->bvh.closestPoint(P);
+
+    const Tri& tri = tris[hit.tri];
+    Eigen::Vector3d pseudoNormal;
+    switch (hit.feature) {
+        case Feature::FACE:     pseudoNormal = tri.faceNormal;      break;
+        case Feature::EDGE_AB:  pseudoNormal = tri.edgeNormalAB;    break;
+        case Feature::EDGE_AC:  pseudoNormal = tri.edgeNormalAC;    break;
+        case Feature::EDGE_BC:  pseudoNormal = tri.edgeNormalBC;    break;
+        case Feature::VERTEX_A: pseudoNormal = vertNormals[tri.iA]; break;
+        case Feature::VERTEX_B: pseudoNormal = vertNormals[tri.iB]; break;
+        case Feature::VERTEX_C: pseudoNormal = vertNormals[tri.iC]; break;
+    }
+    const double sign = ((P - hit.point).dot(pseudoNormal) >= 0.0) ? 1.0 : -1.0;
+    return static_cast<float>(sign * std::sqrt(hit.dist2));
+}
+
+void SDFBoundary::recomputeDistances() {
+    // enable CPU parallelism over the voxel grid
     #pragma omp parallel for schedule(dynamic, 1)
     for (int x = 0; x < _dimensions.x(); ++x) {
         for (int y = 0; y < _dimensions.y(); ++y) {
@@ -345,32 +429,152 @@ void SDFBoundary::buildFromMesh(
                     _origin.y() + y * _cellSize,
                     _origin.z() + z * _cellSize
                 );
-
-                const TriangleBVH::Hit hit = bvh.closestPoint(P);
-
-                const Tri& tri = tris[hit.tri];
-                Eigen::Vector3d pseudoNormal;
-                switch (hit.feature) {
-                    case Feature::FACE:     pseudoNormal = tri.faceNormal;      break;
-                    case Feature::EDGE_AB:  pseudoNormal = tri.edgeNormalAB;    break;
-                    case Feature::EDGE_AC:  pseudoNormal = tri.edgeNormalAC;    break;
-                    case Feature::EDGE_BC:  pseudoNormal = tri.edgeNormalBC;    break;
-                    case Feature::VERTEX_A: pseudoNormal = vertNormals[tri.iA]; break;
-                    case Feature::VERTEX_B: pseudoNormal = vertNormals[tri.iB]; break;
-                    case Feature::VERTEX_C: pseudoNormal = vertNormals[tri.iC]; break;
-                }
-                const double sign = ((P - hit.point).dot(pseudoNormal) >= 0.0) ? 1.0 : -1.0;
-
-                _distances[index(x, y, z)] = static_cast<float>(sign * std::sqrt(hit.dist2));
+                _distances[index(x, y, z)] = signedDistanceAt(P);
             }
         }
     }
+}
 
-    if (verbose) {
-        std::cout << "SDF computed: "
-                  << _dimensions.x() << "x" << _dimensions.y() << "x" << _dimensions.z()
-                  << " (" << total << " voxels, " << tris.size() << " triangles, BVH)\n";
+void SDFBoundary::updateGeometryAndRefit(const std::vector<std::array<double, 3>>& verts) {
+    // Topology is fixed: pull each triangle's corners from the moved vertices
+    // (iA/iB/iC are stable indices set at build time) and refresh the face
+    // normal. Edge/vertex pseudo-normals are intentionally left at their last
+    // full-build values — see refitFromMesh() docs in the header.
+    for (Tri& tri : _accel->tris) {
+        tri.A = Eigen::Vector3d(verts[tri.iA][0], verts[tri.iA][1], verts[tri.iA][2]);
+        tri.B = Eigen::Vector3d(verts[tri.iB][0], verts[tri.iB][1], verts[tri.iB][2]);
+        tri.C = Eigen::Vector3d(verts[tri.iC][0], verts[tri.iC][1], verts[tri.iC][2]);
+        Eigen::Vector3d n = (tri.B - tri.A).cross(tri.C - tri.A);
+        const double len = n.norm();
+        if (len > 1e-12) n /= len;
+        tri.faceNormal = n;
     }
+    _accel->bvh.refit(_accel->tris);   // refit boxes in place (no re-partition)
+}
+
+void SDFBoundary::refitFromMesh(const std::vector<std::array<double, 3>>& verts) {
+    if (!_accel || _accel->tris.empty()) return;
+
+    updateGeometryAndRefit(verts);
+    // Re-evaluate the whole grid over the unchanged origin/dimensions. (A denting
+    // deformation stays inside the original padded bounds; the periodic full
+    // rebuild handles any drift.)
+    recomputeDistances();
+    _buildVerts = verts;
+    _dirtyValid = false;   // a full pass supersedes any pending dirty region
+}
+
+bool SDFBoundary::refitDirty(const std::vector<std::array<double, 3>>& newVerts,
+                             double bandRadius, double moveEps) {
+    // No baseline to diff against (first call after a full build with a different
+    // vertex array, or a size mismatch): fall back to the correct full path, and
+    // mark the whole grid dirty so the caller's uploadDirtyRegion() still pushes
+    // the recomputed field.
+    if (!_accel || _accel->tris.empty() || _buildVerts.size() != newVerts.size()) {
+        refitFromMesh(newVerts);   // full grid recompute (also sets _buildVerts)
+        _dirtyMin   = Eigen::Vector3i::Zero();
+        _dirtyMax   = _dimensions - Eigen::Vector3i::Ones();
+        _dirtyValid = true;
+        return true;
+    }
+
+    // --- Step 1+2: detect moved vertices, mark dirty voxels around old AND new ---
+    for (int idx : _dirtyList) _dirtyMask[idx] = 0;   // clear only what we touched
+    _dirtyList.clear();
+
+    Eigen::Vector3i vmin(std::numeric_limits<int>::max(),
+                         std::numeric_limits<int>::max(),
+                         std::numeric_limits<int>::max());
+    Eigen::Vector3i vmax(std::numeric_limits<int>::min(),
+                         std::numeric_limits<int>::min(),
+                         std::numeric_limits<int>::min());
+
+    const int dx = _dimensions.x(), dy = _dimensions.y(), dz = _dimensions.z();
+    auto markBand = [&](const std::array<double, 3>& w) {
+        const Eigen::Vector3d P(w[0], w[1], w[2]);
+        const Eigen::Vector3d lo = (P.array() - bandRadius - _origin.array()) / _cellSize;
+        const Eigen::Vector3d hi = (P.array() + bandRadius - _origin.array()) / _cellSize;
+        const int x0 = std::clamp((int)std::floor(lo.x()), 0, dx - 1);
+        const int y0 = std::clamp((int)std::floor(lo.y()), 0, dy - 1);
+        const int z0 = std::clamp((int)std::floor(lo.z()), 0, dz - 1);
+        const int x1 = std::clamp((int)std::ceil (hi.x()), 0, dx - 1);
+        const int y1 = std::clamp((int)std::ceil (hi.y()), 0, dy - 1);
+        const int z1 = std::clamp((int)std::ceil (hi.z()), 0, dz - 1);
+        for (int x = x0; x <= x1; ++x)
+            for (int y = y0; y <= y1; ++y)
+                for (int z = z0; z <= z1; ++z) {
+                    const int idx = index(x, y, z);
+                    if (_dirtyMask[idx]) continue;
+                    _dirtyMask[idx] = 1;
+                    _dirtyList.push_back(idx);
+                }
+        vmin = vmin.cwiseMin(Eigen::Vector3i(x0, y0, z0));
+        vmax = vmax.cwiseMax(Eigen::Vector3i(x1, y1, z1));
+    };
+
+    const double moveEps2 = moveEps * moveEps;
+    for (size_t i = 0; i < newVerts.size(); ++i) {
+        const Eigen::Vector3d nv(newVerts[i][0],   newVerts[i][1],   newVerts[i][2]);
+        const Eigen::Vector3d ov(_buildVerts[i][0], _buildVerts[i][1], _buildVerts[i][2]);
+        if ((nv - ov).squaredNorm() <= moveEps2) continue;
+        markBand(_buildVerts[i]);   // clear the stale surface where it used to be
+        markBand(newVerts[i]);      // write the surface where it is now
+    }
+
+    // --- Step 3: refit geometry, then recompute only the dirty voxels ---
+    updateGeometryAndRefit(newVerts);   // uses NEW positions; safe — dirty set already marked
+
+    const int n = static_cast<int>(_dirtyList.size());
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (int k = 0; k < n; ++k) {
+        const int idx = _dirtyList[k];
+        // decode linear index (x*dy*dz + y*dz + z) back to voxel coords
+        const int z =  idx % dz;
+        const int y = (idx / dz) % dy;
+        const int x =  idx / (dy * dz);
+        const Eigen::Vector3d P(_origin.x() + x * _cellSize,
+                                _origin.y() + y * _cellSize,
+                                _origin.z() + z * _cellSize);
+        _distances[idx] = signedDistanceAt(P);
+    }
+
+    _buildVerts = newVerts;
+    _dirtyValid = !_dirtyList.empty();
+    if (_dirtyValid) { _dirtyMin = vmin; _dirtyMax = vmax; }
+
+    // --- Optional verification: dirty voxels must match a full rebuild ---
+    if (_debugVerifyDirty && _dirtyValid) {
+        std::vector<float> dirtyVals(_dirtyList.size());
+        for (size_t k = 0; k < _dirtyList.size(); ++k) dirtyVals[k] = _distances[_dirtyList[k]];
+        recomputeDistances();   // full, authoritative
+        double maxDiff = 0.0;
+        for (size_t k = 0; k < _dirtyList.size(); ++k)
+            maxDiff = std::max(maxDiff, (double)std::fabs(dirtyVals[k] - _distances[_dirtyList[k]]));
+        std::cout << "[SDF dirty verify] " << _dirtyList.size() << " voxels, max |diff| = "
+                  << maxDiff << "\n";
+    }
+
+    return _dirtyValid;
+}
+
+void SDFBoundary::uploadDirtyRegion() {
+    if (!_dirtyValid) return;
+
+    const int x0 = _dirtyMin.x(), y0 = _dirtyMin.y(), z0 = _dirtyMin.z();
+    const int w = _dirtyMax.x() - x0 + 1;
+    const int h = _dirtyMax.y() - y0 + 1;
+    const int d = _dirtyMax.z() - z0 + 1;
+
+    // Repack the dirty box into GL sub-image order (x fastest), the same
+    // transpose uploadToGPU() applies to the whole volume.
+    std::vector<float> sub(static_cast<size_t>(w) * h * d);
+    for (int lz = 0; lz < d; ++lz)
+        for (int ly = 0; ly < h; ++ly)
+            for (int lx = 0; lx < w; ++lx)
+                sub[static_cast<size_t>(lx) + w * (static_cast<size_t>(ly) + static_cast<size_t>(h) * lz)]
+                    = _distances[index(x0 + lx, y0 + ly, z0 + lz)];
+
+    _texture.uploadSubRegion(x0, y0, z0, w, h, d, sub);
 }
 
 void SDFBoundary::uploadToGPU() {

@@ -41,6 +41,18 @@ void Texture3D::upload(int width, int height, int depth, const std::vector<float
     glBindTexture(GL_TEXTURE_3D, 0);
 }
 
+void Texture3D::uploadSubRegion(int x0, int y0, int z0, int w, int h, int d,
+                                const std::vector<float>& data) {
+    if (_id == 0) return;   // nothing allocated yet
+    assert(static_cast<size_t>(w) * h * d == data.size());
+
+    glBindTexture(GL_TEXTURE_3D, _id);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage3D(GL_TEXTURE_3D, 0, x0, y0, z0, w, h, d,
+                    GL_RED, GL_FLOAT, data.data());
+    glBindTexture(GL_TEXTURE_3D, 0);
+}
+
 void Texture3D::bindToUnit(GLuint unit) const {
     glActiveTexture(GL_TEXTURE0 + unit);
     glBindTexture(GL_TEXTURE_3D, _id);
