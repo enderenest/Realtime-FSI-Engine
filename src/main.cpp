@@ -1014,7 +1014,7 @@ int main() {
     glfwMakeContextCurrent(window);
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) { std::cerr << "GLAD failed\n"; return -1; }
 
-    glfwSwapInterval(0);                       // uncapped FPS
+    glfwSwapInterval(1);                       // vsync ON: steady, tear-free frame pacing for the demo
     glfwSetFramebufferSizeCallback(window, framebufferCB);
     glfwSetScrollCallback(window, scrollCB);
     glViewport(0, 0, g_winW, g_winH);
