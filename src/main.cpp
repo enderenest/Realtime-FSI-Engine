@@ -257,8 +257,8 @@ static GLsizei g_arrowVertCount = 0;             // number of arrow line vertice
 static bool    g_drawArrows      = false;        // force-arrow overlay: OFF by default (presentation toggle)
 
 // Render layer: screen-space fluid (clear water) + solid shaded mesh, vs the raw
-// debug view of flat heatmap dots + wireframe. Toggleable live; ON by default.
-static bool    g_renderLayer     = true;
+// debug view of flat heatmap dots + wireframe. Toggleable live; OFF by default.
+static bool    g_renderLayer     = false;
 
 // ---- Screen-space fluid rendering (SSFR) targets + tuning ----
 static int    g_ssfrW = 0, g_ssfrH = 0;          // current FBO size (recreated on resize)
@@ -971,6 +971,7 @@ static void confirmAnchorsAndSpawn(PBFluids& fluid, const FluidConfig& fc) {
     g_deformer = std::make_unique<LaplacianDeformation>(g_deformMesh);
     g_deformer->initialize();                     // rest differential coords + normal system (once)
     g_deformer->setUseLocal(g_useLocalDeform);
+    g_deformer->setLocalKRing(g_localKRing);
     g_deformer->setUseIncremental(g_useIncremental);
     for (int a : g_anchors) g_deformer->addAnchor(a);
     g_deformer->precomputeSystem();               // analyze (etree) + factorize with anchors only
@@ -1202,6 +1203,17 @@ int main() {
         g_sdfPadding   = sc.sdfPadding;
         g_sdfContainer = sc.sdfContainer;
 
+        // Deformation characteristics for this scene (mirror of the panel tuning).
+        g_stiffness          = sc.deform.stiffness;
+        g_maxDisplacement    = sc.deform.maxDisplacement;
+        g_maxTotalDisp       = sc.deform.maxTotalDisp;
+        g_restoreEnabled     = sc.deform.restoreEnabled;
+        g_restoreStrength    = sc.deform.restoreStrength;
+        g_controlThreshold   = sc.deform.controlThreshold;
+        g_controlThresholdLow = sc.deform.controlThresholdLow;
+        g_localKRing         = sc.deform.localKRing;
+        g_contactRadius      = sc.deform.contactRadius;
+
         pointSize  = sc.pointSize;
         g_camYaw   = sc.camYaw;
         g_camPitch = sc.camPitch;
@@ -1222,6 +1234,13 @@ int main() {
             if (g_offFiles[i].find(sc.meshFile) != std::string::npos) { fileIdx = i; break; }
         if (fileIdx >= 0) { g_selFile = fileIdx; loadMeshAndSetup(g_offFiles[fileIdx], fluid); }
         else loadMeshAndSetup(std::string(RESOURCES_PATH) + "assets/" + sc.meshFile, fluid);
+
+        // Apply the scene's mesh placement on top of the freshly fitted mesh.
+        // loadMeshAndSetup resets the transform to identity, so set it here and
+        // re-transform (this also refreshes the wireframe + pick/deform mesh).
+        g_meshTranslate = sc.meshTranslate;
+        g_meshRotDeg    = sc.meshRotDeg;
+        applyMeshTransform();
     };
 
     loadScene(currentScene);            // boot into the first scene
@@ -1689,9 +1708,8 @@ int main() {
         }
 
         // ---- Clear -----------------------------------------------
-        // Neutral grey backdrop in render-layer mode; darker grey for debug.
-        if (g_renderLayer) glClearColor(0.50f, 0.51f, 0.53f, 1.0f);
-        else               glClearColor(0.20f, 0.20f, 0.20f, 1.0f);
+        // Same dark-grey backdrop in both render-layer and debug modes.
+        glClearColor(0.20f, 0.20f, 0.20f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glEnable(GL_DEPTH_TEST);
 
@@ -1714,7 +1732,7 @@ int main() {
             // the backdrop the water sits against and refracts.
             glBindFramebuffer(GL_FRAMEBUFFER, g_sceneFBO);
             glViewport(0, 0, g_winW, g_winH);
-            glClearColor(0.50f, 0.51f, 0.53f, 1.0f);
+            glClearColor(0.20f, 0.20f, 0.20f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             glEnable(GL_DEPTH_TEST);
             if (g_sdfEnabled && g_meshIdxCount > 0) {
